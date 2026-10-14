@@ -1,5 +1,8 @@
 "use client";
 import Chart from "./Chart";
+import { getFb } from "@/lib/firebase";
+import { GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut, type User } from "firebase/auth";
+import { doc, getDoc, setDoc } from "firebase/firestore";
 import { analyze, buildSeries, type Hist, type Live, type Position } from "@/lib/analysis";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -16,6 +19,11 @@ export default function Home() {
   const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [updated, setUpdated] = useState<Date | null>(null);
+  const [user, setUser] = useState<User | null | undefined>(undefined);
+  const [fbOn, setFbOn] = useState(false);
+  const [cloudReady, setCloudReady] = useState(false);
+  const [authError, setAuthError] = useState("");
+  const [saveState, setSaveState] = useState<"" | "saving" | "saved" | "error">("");
   const [range, setRange] = useState("1y");
   const [hist, setHist] = useState<Hist>({});
   const [histLoading, setHistLoading] = useState(false);
@@ -24,10 +32,62 @@ export default function Home() {
   useEffect(() => {
     try { setPositions(JSON.parse(localStorage.getItem(KEY) || "[]")); } catch {}
     setLoaded(true);
+    const fb = getFb();
+    if (!fb) { setUser(null); return; }
+    setFbOn(true);
+    return onAuthStateChanged(fb.auth, async (u) => {
+      if (!u) { setUser(null); setCloudReady(false); return; }
+      try {
+        const snap = await getDoc(doc(fb.db, "users", u.uid));
+        const cloud: Position[] = snap.exists() ? (snap.data().positions ?? []) : [];
+        let local: Position[] = [];
+        try { local = JSON.parse(localStorage.getItem(KEY) || "[]"); } catch {}
+        const ids = new Set(cloud.map((p) => p.id));
+        setPositions([...cloud, ...local.filter((p) => !ids.has(p.id))]);
+        try { localStorage.removeItem(KEY); } catch {}
+        setUser(u);
+        setCloudReady(true);
+      } catch {
+        setAuthError("No se pudieron cargar tus datos de la nube. Revisa la configuración de Firestore.");
+        setUser(u);
+      }
+    });
   }, []);
+
   useEffect(() => {
-    if (loaded) try { localStorage.setItem(KEY, JSON.stringify(positions)); } catch {}
-  }, [positions, loaded]);
+    if (!loaded || user === undefined) return;
+    if (user) {
+      if (!cloudReady) return;
+      const fb = getFb();
+      if (!fb) return;
+      setSaveState("saving");
+      const t = setTimeout(async () => {
+        try {
+          await setDoc(doc(fb.db, "users", user.uid), { positions: JSON.parse(JSON.stringify(positions)), updatedAt: Date.now() });
+          setSaveState("saved");
+        } catch { setSaveState("error"); }
+      }, 600);
+      return () => clearTimeout(t);
+    }
+    try { localStorage.setItem(KEY, JSON.stringify(positions)); } catch {}
+  }, [positions, loaded, user, cloudReady]);
+
+  const login = async () => {
+    const fb = getFb();
+    if (!fb) return;
+    setAuthError("");
+    try { await signInWithPopup(fb.auth, new GoogleAuthProvider()); }
+    catch (e) {
+      const code = (e as { code?: string })?.code ?? "error";
+      if (code !== "auth/popup-closed-by-user" && code !== "auth/cancelled-popup-request") setAuthError(`No se pudo iniciar sesión (${code}).`);
+    }
+  };
+  const logout = async () => {
+    const fb = getFb();
+    if (!fb) return;
+    setPositions([]); setCloudReady(false); setSaveState("");
+    await signOut(fb.auth);
+  };
 
   const symbolsKey = useMemo(() => [...new Set(positions.map((p) => p.symbol))].sort().join(","), [positions]);
 
@@ -98,11 +158,21 @@ export default function Home() {
     <div className="wrap">
       <header>
         <h1>Mi cartera</h1>
-        <div className="row">
+        <div className="row" style={{ flexWrap: "wrap" }}>
+          {fbOn && user && (
+            <span className="label">
+              {user.displayName ?? user.email}
+              {saveState === "saving" && " · guardando…"}{saveState === "saved" && " · guardado ✓"}{saveState === "error" && " · error al guardar"}
+            </span>
+          )}
+          {fbOn && user === null && <button className="ghost" onClick={login}>Iniciar sesión con Google</button>}
+          {fbOn && user && <button className="ghost" onClick={logout}>Salir</button>}
           <button className="ghost" onClick={refresh} disabled={loading}>{loading ? "Actualizando…" : "Actualizar precios"}</button>
           <button className="btn" onClick={() => dlg.current?.showModal()}>Añadir posición</button>
         </div>
       </header>
+
+      {authError && <p className="down" role="alert">{authError}</p>}
 
       <section className="hero">
         <div className="label">Valor total{updated && ` · precios de las ${updated.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" })}`}</div>
@@ -188,7 +258,7 @@ export default function Home() {
               </table>
             )}
           </div>
-          <p className="note">Punto verde: precio en vivo, convertido a euros. Punto gris: no se encontró ese símbolo; escribe el precio a mano. Los datos se guardan en este navegador.</p>
+          <p className="note">Punto verde: precio en vivo, convertido a euros. Punto gris: no se encontró ese símbolo; escribe el precio a mano. Si no inicias sesión, los datos se guardan solo en este navegador.</p>
         </section>
       </div>
 
