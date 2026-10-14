@@ -41,3 +41,7 @@ form input,form select{background:var(--input);border:1px solid var(--line);bord
 .note{color:var(--muted);font-size:12px;margin-top:14px}
 .insights{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
 .insight{border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.tabs{display:flex;gap:2px;flex-wrap:wrap;align-items:center;border-bottom:1px solid var(--line);margin-bottom:16px}
+.tab{background:none;border:0;border-bottom:2px solid transparent;margin-bottom:-1px;padding:8px 12px;color:var(--muted);cursor:pointer;font-weight:600}
+.tab.on{color:var(--text);border-bottom-color:var(--accent)}
+.acc{display:inline-block;margin-top:2px;padding:0 6px;border:1px solid var(--line);border-radius:6px;font-size:11px;color:var(--muted)}

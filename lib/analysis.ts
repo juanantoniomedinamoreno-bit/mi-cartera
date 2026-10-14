@@ -1,4 +1,5 @@
-export type Position = { id: string; symbol: string; name: string; type: string; qty: number; avg: number; price: number; buyDate?: string };
+export type Account = { id: string; name: string };
+export type Position = { id: string; accountId: string; symbol: string; name: string; type: string; qty: number; avg: number; price: number; buyDate?: string };
 export type Live = Record<string, { price: number; change24h?: number }>;
 export type Hist = Record<string, { t: number[]; p: number[] }>;
 export type Point = { d: string; value: number; invested: number };
@@ -36,7 +37,7 @@ const eur = (v: number) => new Intl.NumberFormat("es-ES", { style: "currency", c
 const pc = (v: number) => (v >= 0 ? "+" : "") + v.toFixed(1).replace(".", ",") + "%";
 const fdate = (d: string) => new Date(d).toLocaleDateString("es-ES", { day: "numeric", month: "short", year: "numeric" });
 
-export function analyze(positions: Position[], live: Live, points: Point[]): Insight[] {
+export function analyze(positions: Position[], live: Live, points: Point[], accounts: Account[] = []): Insight[] {
   if (!positions.length) return [];
   const out: Insight[] = [];
   const rows = positions.map((p) => {
@@ -67,6 +68,14 @@ export function analyze(positions: Position[], live: Live, points: Point[]): Ins
     const byType: Record<string, number> = {};
     rows.forEach((r) => { byType[r.p.type] = (byType[r.p.type] ?? 0) + r.v; });
     out.push({ title: "Por tipo de activo", text: Object.entries(byType).sort((a, b) => b[1] - a[1]).map(([t, v]) => `${t} ${((v / total) * 100).toFixed(0)}%`).join(" · ") });
+  }
+  if (total > 0 && accounts.length > 1) {
+    const byAcc: Record<string, number> = {};
+    rows.forEach((r) => { byAcc[r.p.accountId] = (byAcc[r.p.accountId] ?? 0) + r.v; });
+    if (Object.keys(byAcc).length > 1) {
+      const name = (id: string) => accounts.find((a) => a.id === id)?.name ?? "Otra";
+      out.push({ title: "Por cartera", text: Object.entries(byAcc).sort((a, b) => b[1] - a[1]).map(([id, v]) => `${name(id)} ${((v / total) * 100).toFixed(0)}%`).join(" · ") });
+    }
   }
   if (points.length > 1) {
     const pl = points.map((p) => ({ d: p.d, r: ((p.value - p.invested) / p.invested) * 100 }));

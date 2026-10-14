@@ -4,7 +4,7 @@ import { CRYPTO, ISIN, resolveIsin, toEur, yahooRaw } from "@/lib/market";
 export const dynamic = "force-dynamic";
 
 const RANGES: Record<string, [string, string]> = {
-  "1m": ["1mo", "1d"], "6m": ["6mo", "1d"], "1y": ["1y", "1d"], "5y": ["5y", "1wk"],
+  "1w": ["5d", "1d"], "1m": ["1mo", "1d"], "ytd": ["ytd", "1d"], "max": ["max", "1mo"], "6m": ["6mo", "1d"], "1y": ["1y", "1d"], "5y": ["5y", "1wk"],
 };
 
 export async function GET(req: Request) {

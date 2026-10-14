@@ -4,11 +4,19 @@ import { parseCsv } from "@/lib/csv";
 import { getFb } from "@/lib/firebase";
 import { GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut, type User } from "firebase/auth";
 import { doc, getDoc, setDoc } from "firebase/firestore";
-import { analyze, buildSeries, type Hist, type Live, type Position } from "@/lib/analysis";
+import { analyze, buildSeries, type Account, type Hist, type Live, type Position } from "@/lib/analysis";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 
 const KEY = "gq_positions_v2";
+const KEYA = "gq_accounts_v1";
+const MAIN: Account = { id: "main", name: "Principal" };
+const fixPositions = (ps: Position[]): Position[] => ps.map((p) => ({ ...p, accountId: p.accountId ?? "main" }));
+const ensureAccounts = (accs: Account[], ps: Position[]): Account[] => {
+  const out = accs.length ? [...accs] : [MAIN];
+  for (const p of ps) if (!out.some((a) => a.id === p.accountId)) out.push({ id: p.accountId, name: p.accountId === "main" ? "Principal" : "Cartera" });
+  return out;
+};
 const COLORS = ["#0f8a5f", "#3b82f6", "#f59e0b", "#ef4444", "#8b5cf6", "#06b6d4", "#ec4899", "#84cc16"];
 const money = (v: number) => new Intl.NumberFormat("es-ES", { style: "currency", currency: "EUR" }).format(v);
 const pct = (v: number) => (v >= 0 ? "+" : "") + v.toFixed(2).replace(".", ",") + "%";
@@ -16,6 +24,8 @@ const cls = (v: number) => (v >= 0 ? "up" : "down");
 
 export default function Home() {
   const [positions, setPositions] = useState<Position[]>([]);
+  const [accounts, setAccounts] = useState<Account[]>([MAIN]);
+  const [tab, setTab] = useState("all");
   const [live, setLive] = useState<Live>({});
   const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -33,7 +43,11 @@ export default function Home() {
   const [importMsg, setImportMsg] = useState("");
 
   useEffect(() => {
-    try { setPositions(JSON.parse(localStorage.getItem(KEY) || "[]")); } catch {}
+    let lp: Position[] = [], la: Account[] = [];
+    try { lp = fixPositions(JSON.parse(localStorage.getItem(KEY) || "[]")); } catch {}
+    try { la = JSON.parse(localStorage.getItem(KEYA) || "[]"); } catch {}
+    setPositions(lp);
+    setAccounts(ensureAccounts(la, lp));
     setLoaded(true);
     const fb = getFb();
     if (!fb) { setUser(null); return; }
@@ -42,12 +56,17 @@ export default function Home() {
       if (!u) { setUser(null); setCloudReady(false); return; }
       try {
         const snap = await getDoc(doc(fb.db, "users", u.uid));
-        const cloud: Position[] = snap.exists() ? (snap.data().positions ?? []) : [];
-        let local: Position[] = [];
-        try { local = JSON.parse(localStorage.getItem(KEY) || "[]"); } catch {}
+        const cloud: Position[] = snap.exists() ? fixPositions(snap.data().positions ?? []) : [];
+        const cloudAcc: Account[] = snap.exists() ? (snap.data().accounts ?? []) : [];
+        let local: Position[] = [], localAcc: Account[] = [];
+        try { local = fixPositions(JSON.parse(localStorage.getItem(KEY) || "[]")); } catch {}
+        try { localAcc = JSON.parse(localStorage.getItem(KEYA) || "[]"); } catch {}
         const ids = new Set(cloud.map((p) => p.id));
-        setPositions([...cloud, ...local.filter((p) => !ids.has(p.id))]);
-        try { localStorage.removeItem(KEY); } catch {}
+        const merged = [...cloud, ...local.filter((p) => !ids.has(p.id))];
+        const aids = new Set(cloudAcc.map((a) => a.id));
+        setPositions(merged);
+        setAccounts(ensureAccounts([...cloudAcc, ...localAcc.filter((a) => !aids.has(a.id))], merged));
+        try { localStorage.removeItem(KEY); localStorage.removeItem(KEYA); } catch {}
         setUser(u);
         setCloudReady(true);
       } catch {
@@ -66,14 +85,14 @@ export default function Home() {
       setSaveState("saving");
       const t = setTimeout(async () => {
         try {
-          await setDoc(doc(fb.db, "users", user.uid), { positions: JSON.parse(JSON.stringify(positions)), updatedAt: Date.now() });
+          await setDoc(doc(fb.db, "users", user.uid), { positions: JSON.parse(JSON.stringify(positions)), accounts, updatedAt: Date.now() });
           setSaveState("saved");
         } catch { setSaveState("error"); }
       }, 600);
       return () => clearTimeout(t);
     }
-    try { localStorage.setItem(KEY, JSON.stringify(positions)); } catch {}
-  }, [positions, loaded, user, cloudReady]);
+    try { localStorage.setItem(KEY, JSON.stringify(positions)); localStorage.setItem(KEYA, JSON.stringify(accounts)); } catch {}
+  }, [positions, accounts, loaded, user, cloudReady]);
 
   async function onFile(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0];
@@ -84,12 +103,24 @@ export default function Home() {
     if (text.includes("\uFFFD")) text = new TextDecoder("windows-1252").decode(buf);
     const res = parseCsv(text);
     if (res.error) { setImportMsg(res.error); return; }
-    setPositions((prev) => [...prev, ...res.positions.map((p) => ({ ...p, id: crypto.randomUUID() }))]);
+    let accs = [...accounts];
+    const target = tab !== "all" ? tab : accs[0]?.id ?? "main";
+    const mapped: Position[] = res.positions.map(({ account, ...p }) => {
+      let accountId = target;
+      if (account) {
+        let a = accs.find((x) => x.name.toLowerCase() === account.toLowerCase());
+        if (!a) { a = { id: crypto.randomUUID(), name: account }; accs = [...accs, a]; }
+        accountId = a.id;
+      }
+      return { ...p, accountId, id: crypto.randomUUID() };
+    });
+    setAccounts(accs);
+    setPositions((prev) => [...prev, ...mapped]);
     setImportMsg(`Se importaron ${res.positions.length} posiciones` + (res.skipped ? ` (${res.skipped} filas ignoradas por datos incompletos)` : "") + ".");
   }
 
   function downloadTemplate() {
-    const csv = "\uFEFFSímbolo;Nombre;Tipo;Cantidad;Precio medio;Fecha compra\nAAPL;Apple;Acción;10;150,50;2024-03-15\nIE00B03HCZ61;Fondo de ejemplo;Fondo de inversión;25,5;42,10;15/06/2023\nBTC;Bitcoin;Cripto;0,05;30000;2023-01-10\n";
+    const csv = "\uFEFFSímbolo;Nombre;Tipo;Cantidad;Precio medio;Fecha compra;Cuenta\nAAPL;Apple;Acción;10;150,50;2024-03-15;Degiro\nIE00B03HCZ61;Fondo de ejemplo;Fondo de inversión;25,5;42,10;15/06/2023;MyInvestor\nBTC;Bitcoin;Cripto;0,05;30000;2023-01-10;Cripto\n";
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
     a.download = "plantilla-cartera.csv";
@@ -110,9 +141,33 @@ export default function Home() {
   const logout = async () => {
     const fb = getFb();
     if (!fb) return;
-    setPositions([]); setCloudReady(false); setSaveState("");
+    setPositions([]); setAccounts([MAIN]); setTab("all"); setCloudReady(false); setSaveState("");
     await signOut(fb.auth);
   };
+
+  const activeTab = tab === "all" || accounts.some((a) => a.id === tab) ? tab : "all";
+  const view = useMemo(() => (activeTab === "all" ? positions : positions.filter((p) => p.accountId === activeTab)), [positions, activeTab]);
+  const accName = (id: string) => accounts.find((a) => a.id === id)?.name ?? "—";
+  const tabName = activeTab === "all" ? "Agregado" : accName(activeTab);
+
+  function addAccount() {
+    const name = prompt("Nombre de la nueva cartera (por ejemplo, MyInvestor o Degiro)")?.trim();
+    if (!name) return;
+    const a = { id: crypto.randomUUID(), name };
+    setAccounts((prev) => [...prev, a]);
+    setTab(a.id);
+  }
+  function renameAccount() {
+    const name = prompt("Nuevo nombre de la cartera", accName(activeTab))?.trim();
+    if (name) setAccounts((prev) => prev.map((a) => (a.id === activeTab ? { ...a, name } : a)));
+  }
+  function deleteAccount() {
+    const n = positions.filter((p) => p.accountId === activeTab).length;
+    if (!confirm(`¿Eliminar la cartera «${accName(activeTab)}» y sus ${n} posiciones? No se puede deshacer.`)) return;
+    setPositions((prev) => prev.filter((p) => p.accountId !== activeTab));
+    setAccounts((prev) => prev.filter((a) => a.id !== activeTab));
+    setTab("all");
+  }
 
   const symbolsKey = useMemo(() => [...new Set(positions.map((p) => p.symbol))].sort().join(","), [positions]);
 
@@ -146,18 +201,23 @@ export default function Home() {
     return () => { cancelled = true; };
   }, [loaded, symbolsKey, range]);
 
-  const series = useMemo(() => buildSeries(positions, hist), [positions, hist]);
-  const insights = useMemo(() => analyze(positions, live, series.points), [positions, live, series.points]);
+  const series = useMemo(() => buildSeries(view, hist), [view, hist]);
+  const insights = useMemo(() => analyze(view, live, series.points, accounts), [view, live, series.points, accounts]);
 
   const priceOf = (p: Position) => live[p.symbol]?.price ?? p.price;
 
   const totals = useMemo(() => {
-    let v = 0, c = 0;
-    positions.forEach((p) => { v += p.qty * (live[p.symbol]?.price ?? p.price); c += p.qty * p.avg; });
-    return { v, c, pl: v - c, plp: c > 0 ? ((v - c) / c) * 100 : 0 };
-  }, [positions, live]);
+    let v = 0, c = 0, day = 0;
+    view.forEach((p) => {
+      const val = p.qty * (live[p.symbol]?.price ?? p.price);
+      v += val; c += p.qty * p.avg;
+      const ch = live[p.symbol]?.change24h;
+      if (ch != null) day += val - val / (1 + ch / 100);
+    });
+    return { v, c, pl: v - c, plp: c > 0 ? ((v - c) / c) * 100 : 0, day, dayp: v - day > 0 ? (day / (v - day)) * 100 : 0 };
+  }, [view, live]);
 
-  const items = positions.map((p) => ({ n: p.symbol, v: p.qty * priceOf(p) })).filter((i) => i.v > 0);
+  const items = view.map((p) => ({ n: p.symbol, v: p.qty * priceOf(p) })).filter((i) => i.v > 0);
 
   function onSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -168,6 +228,7 @@ export default function Home() {
     if (!symbol || !(qty > 0) || !(avg >= 0)) return;
     setPositions((prev) => [...prev, {
       id: crypto.randomUUID(), symbol, name: String(d.get("name")).trim() || symbol,
+      accountId: String(d.get("account") || accounts[0]?.id || "main"),
       type: String(d.get("type")), qty, avg, price: avg,
       buyDate: String(d.get("date") || "") || undefined,
     }]);
@@ -206,9 +267,24 @@ export default function Home() {
       )}
       {authError && <p className="down" role="alert">{authError}</p>}
 
+      <div className="tabs" role="tablist">
+        <button role="tab" aria-selected={activeTab === "all"} className={activeTab === "all" ? "tab on" : "tab"} onClick={() => setTab("all")}>Agregado</button>
+        {accounts.map((a) => (
+          <button key={a.id} role="tab" aria-selected={activeTab === a.id} className={activeTab === a.id ? "tab on" : "tab"} onClick={() => setTab(a.id)}>{a.name}</button>
+        ))}
+        <button className="tab" onClick={addAccount}>+ Agregar cartera</button>
+        {activeTab !== "all" && (
+          <span className="row" style={{ marginLeft: "auto" }}>
+            <button className="ghost" style={{ padding: "3px 10px" }} onClick={renameAccount}>Renombrar</button>
+            {accounts.length > 1 && <button className="ghost" style={{ padding: "3px 10px" }} onClick={deleteAccount}>Eliminar cartera</button>}
+          </span>
+        )}
+      </div>
+
       <section className="hero">
-        <div className="label">Valor total{updated && ` · precios de las ${updated.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" })}`}</div>
+        <div className="label">{tabName} · Valor total{updated && ` · precios de las ${updated.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" })}`}</div>
         <div className="total">{money(totals.v)}</div>
+        {totals.day !== 0 && <div className={cls(totals.day)}>{totals.day >= 0 ? "↗" : "↘"} {pct(totals.dayp)} ({money(totals.day)}) hoy</div>}
         <div className="meta">
           <div><span className="label">Invertido</span><b>{money(totals.c)}</b></div>
           <div><span className="label">Ganancia / pérdida</span><b className={cls(totals.pl)}>{money(totals.pl)}</b></div>
@@ -220,15 +296,15 @@ export default function Home() {
         <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap", marginBottom: 8 }}>
           <h2 style={{ margin: 0 }}>Evolución</h2>
           <div className="row">
-            {[["1m", "1M"], ["6m", "6M"], ["1y", "1A"], ["5y", "5A"]].map(([k, l]) => (
+            {[["1w", "1S"], ["1m", "1M"], ["6m", "6M"], ["ytd", "YTD"], ["1y", "1A"], ["5y", "5A"], ["max", "Máx"]].map(([k, l]) => (
               <button key={k} className={range === k ? "btn" : "ghost"} style={{ padding: "5px 12px" }} onClick={() => setRange(k)}>{l}</button>
             ))}
           </div>
         </div>
-        {positions.length === 0 ? <p className="empty">Añade posiciones para ver su evolución.</p>
+        {view.length === 0 ? <p className="empty">Añade posiciones para ver su evolución.</p>
           : histLoading ? <p className="empty">Cargando histórico…</p>
           : <Chart points={series.points} />}
-        {series.missing.length > 0 && !histLoading && positions.length > 0 && (
+        {series.missing.length > 0 && !histLoading && view.length > 0 && (
           <p className="note">Sin histórico para: {series.missing.join(", ")}. No se incluyen en el gráfico.</p>
         )}
         <p className="note">Se calcula con los precios históricos y la cantidad actual de cada posición desde su fecha de compra. Si una posición no tiene fecha, se cuenta desde el inicio del periodo. Los activos en otras divisas usan el tipo de cambio de hoy.</p>
@@ -260,16 +336,16 @@ export default function Home() {
         <section className="panel">
           <h2>Posiciones</h2>
           <div className="scroll">
-            {positions.length === 0 ? <p className="empty">Aún no hay posiciones. Pulsa «Añadir posición» para crear la primera.</p> : (
+            {view.length === 0 ? <p className="empty">Aún no hay posiciones en esta cartera. Pulsa «Añadir posición» para crear la primera.</p> : (
               <table>
                 <thead><tr><th>Activo</th><th>Cantidad</th><th>P. medio</th><th>Precio actual</th><th>24h</th><th>Valor</th><th>P/L</th><th /></tr></thead>
                 <tbody>
-                  {positions.map((p) => {
+                  {view.map((p) => {
                     const lv = live[p.symbol];
                     const price = priceOf(p), val = p.qty * price, cost = p.qty * p.avg, g = val - cost, gp = cost > 0 ? (g / cost) * 100 : 0;
                     return (
                       <tr key={p.id}>
-                        <td><div className="sym">{p.symbol}</div><div className="nm">{p.name} · {p.type}</div></td>
+                        <td><div className="sym">{p.symbol}</div><div className="nm">{p.name} · {p.type}</div>{activeTab === "all" && accounts.length > 1 && <span className="acc">{accName(p.accountId)}</span>}</td>
                         <td>{p.qty}</td>
                         <td>{money(p.avg)}</td>
                         <td>
@@ -312,6 +388,7 @@ export default function Home() {
       <dialog ref={dlg}>
         <form onSubmit={onSubmit}>
           <h2>Añadir posición</h2>
+          <label>Cartera<select name="account" key={activeTab} defaultValue={activeTab === "all" ? accounts[0]?.id : activeTab}>{accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}</select></label>
           <label>Símbolo o ISIN<input name="symbol" required placeholder="AAPL, BTC, VWCE.DE, IE00B03HCZ61…" /></label>
           <label>Nombre (opcional)<input name="name" placeholder="Apple" /></label>
           <div className="two">
