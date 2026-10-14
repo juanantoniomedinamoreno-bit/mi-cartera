@@ -1,5 +1,6 @@
 "use client";
 import Chart from "./Chart";
+import { parseCsv } from "@/lib/csv";
 import { getFb } from "@/lib/firebase";
 import { GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut, type User } from "firebase/auth";
 import { doc, getDoc, setDoc } from "firebase/firestore";
@@ -28,6 +29,8 @@ export default function Home() {
   const [hist, setHist] = useState<Hist>({});
   const [histLoading, setHistLoading] = useState(false);
   const dlg = useRef<HTMLDialogElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [importMsg, setImportMsg] = useState("");
 
   useEffect(() => {
     try { setPositions(JSON.parse(localStorage.getItem(KEY) || "[]")); } catch {}
@@ -71,6 +74,28 @@ export default function Home() {
     }
     try { localStorage.setItem(KEY, JSON.stringify(positions)); } catch {}
   }, [positions, loaded, user, cloudReady]);
+
+  async function onFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0];
+    e.target.value = "";
+    if (!f) return;
+    const buf = await f.arrayBuffer();
+    let text = new TextDecoder("utf-8").decode(buf);
+    if (text.includes("\uFFFD")) text = new TextDecoder("windows-1252").decode(buf);
+    const res = parseCsv(text);
+    if (res.error) { setImportMsg(res.error); return; }
+    setPositions((prev) => [...prev, ...res.positions.map((p) => ({ ...p, id: crypto.randomUUID() }))]);
+    setImportMsg(`Se importaron ${res.positions.length} posiciones` + (res.skipped ? ` (${res.skipped} filas ignoradas por datos incompletos)` : "") + ".");
+  }
+
+  function downloadTemplate() {
+    const csv = "\uFEFFSímbolo;Nombre;Tipo;Cantidad;Precio medio;Fecha compra\nAAPL;Apple;Acción;10;150,50;2024-03-15\nIE00B03HCZ61;Fondo de ejemplo;Fondo de inversión;25,5;42,10;15/06/2023\nBTC;Bitcoin;Cripto;0,05;30000;2023-01-10\n";
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    a.download = "plantilla-cartera.csv";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
 
   const login = async () => {
     const fb = getFb();
@@ -167,11 +192,18 @@ export default function Home() {
           )}
           {fbOn && user === null && <button className="ghost" onClick={login}>Iniciar sesión con Google</button>}
           {fbOn && user && <button className="ghost" onClick={logout}>Salir</button>}
+          <input ref={fileRef} type="file" accept=".csv,text/csv" hidden onChange={onFile} />
+          <button className="ghost" onClick={() => fileRef.current?.click()}>Importar CSV</button>
           <button className="ghost" onClick={refresh} disabled={loading}>{loading ? "Actualizando…" : "Actualizar precios"}</button>
           <button className="btn" onClick={() => dlg.current?.showModal()}>Añadir posición</button>
         </div>
       </header>
 
+      {importMsg && (
+        <p role="status" className="note" style={{ fontSize: 14, color: "var(--text)" }}>
+          {importMsg} <button className="ghost" style={{ padding: "2px 8px", marginLeft: 6 }} onClick={() => setImportMsg("")}>Cerrar</button>
+        </p>
+      )}
       {authError && <p className="down" role="alert">{authError}</p>}
 
       <section className="hero">
@@ -258,7 +290,7 @@ export default function Home() {
               </table>
             )}
           </div>
-          <p className="note">Punto verde: precio en vivo, convertido a euros. Punto gris: no se encontró ese símbolo; escribe el precio a mano. Si no inicias sesión, los datos se guardan solo en este navegador.</p>
+          <p className="note">Punto verde: precio en vivo, convertido a euros. Punto gris: no se encontró ese símbolo; escribe el precio a mano. <button className="ghost" style={{ padding: "2px 8px" }} onClick={downloadTemplate}>Descargar plantilla CSV</button> Si no inicias sesión, los datos se guardan solo en este navegador.</p>
         </section>
       </div>
 
