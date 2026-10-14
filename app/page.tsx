@@ -1,8 +1,8 @@
 "use client";
+import Chart from "./Chart";
+import { analyze, buildSeries, type Hist, type Live, type Position } from "@/lib/analysis";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-type Position = { id: string; symbol: string; name: string; type: string; qty: number; avg: number; price: number };
-type Live = Record<string, { price: number; change24h?: number }>;
 
 const KEY = "gq_positions_v2";
 const COLORS = ["#0f8a5f", "#3b82f6", "#f59e0b", "#ef4444", "#8b5cf6", "#06b6d4", "#ec4899", "#84cc16"];
@@ -16,6 +16,9 @@ export default function Home() {
   const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [updated, setUpdated] = useState<Date | null>(null);
+  const [range, setRange] = useState("1y");
+  const [hist, setHist] = useState<Hist>({});
+  const [histLoading, setHistLoading] = useState(false);
   const dlg = useRef<HTMLDialogElement>(null);
 
   useEffect(() => {
@@ -46,6 +49,21 @@ export default function Home() {
     return () => clearInterval(t);
   }, [loaded, refresh]);
 
+  useEffect(() => {
+    if (!loaded || !symbolsKey) { setHist({}); return; }
+    let cancelled = false;
+    setHistLoading(true);
+    fetch(`/api/history?symbols=${encodeURIComponent(symbolsKey)}&range=${range}`)
+      .then((r) => r.json())
+      .then((h) => { if (!cancelled) setHist(h); })
+      .catch(() => { if (!cancelled) setHist({}); })
+      .finally(() => { if (!cancelled) setHistLoading(false); });
+    return () => { cancelled = true; };
+  }, [loaded, symbolsKey, range]);
+
+  const series = useMemo(() => buildSeries(positions, hist), [positions, hist]);
+  const insights = useMemo(() => analyze(positions, live, series.points), [positions, live, series.points]);
+
   const priceOf = (p: Position) => live[p.symbol]?.price ?? p.price;
 
   const totals = useMemo(() => {
@@ -66,6 +84,7 @@ export default function Home() {
     setPositions((prev) => [...prev, {
       id: crypto.randomUUID(), symbol, name: String(d.get("name")).trim() || symbol,
       type: String(d.get("type")), qty, avg, price: avg,
+      buyDate: String(d.get("date") || "") || undefined,
     }]);
     dlg.current?.close();
     e.currentTarget.reset();
@@ -93,6 +112,24 @@ export default function Home() {
           <div><span className="label">Ganancia / pérdida</span><b className={cls(totals.pl)}>{money(totals.pl)}</b></div>
           <div><span className="label">Rentabilidad</span><b className={cls(totals.plp)}>{pct(totals.plp)}</b></div>
         </div>
+      </section>
+
+      <section className="panel" style={{ marginBottom: 16 }}>
+        <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap", marginBottom: 8 }}>
+          <h2 style={{ margin: 0 }}>Evolución</h2>
+          <div className="row">
+            {[["1m", "1M"], ["6m", "6M"], ["1y", "1A"], ["5y", "5A"]].map(([k, l]) => (
+              <button key={k} className={range === k ? "btn" : "ghost"} style={{ padding: "5px 12px" }} onClick={() => setRange(k)}>{l}</button>
+            ))}
+          </div>
+        </div>
+        {positions.length === 0 ? <p className="empty">Añade posiciones para ver su evolución.</p>
+          : histLoading ? <p className="empty">Cargando histórico…</p>
+          : <Chart points={series.points} />}
+        {series.missing.length > 0 && !histLoading && positions.length > 0 && (
+          <p className="note">Sin histórico para: {series.missing.join(", ")}. No se incluyen en el gráfico.</p>
+        )}
+        <p className="note">Se calcula con los precios históricos y la cantidad actual de cada posición desde su fecha de compra. Si una posición no tiene fecha, se cuenta desde el inicio del periodo. Los activos en otras divisas usan el tipo de cambio de hoy.</p>
       </section>
 
       <div className="grid">
@@ -155,6 +192,21 @@ export default function Home() {
         </section>
       </div>
 
+      {insights.length > 0 && (
+        <section className="panel" style={{ marginTop: 16 }}>
+          <h2>Análisis de la cartera</h2>
+          <div className="insights">
+            {insights.map((i, k) => (
+              <div key={k} className="insight">
+                <div className="label">{i.title}</div>
+                <div className={i.tone ?? ""}>{i.text}</div>
+              </div>
+            ))}
+          </div>
+          <p className="note">Es un resumen automático de tus datos, no asesoramiento financiero. La rentabilidad pasada no garantiza la futura.</p>
+        </section>
+      )}
+
       <dialog ref={dlg}>
         <form onSubmit={onSubmit}>
           <h2>Añadir posición</h2>
@@ -165,6 +217,7 @@ export default function Home() {
             <label>Cantidad / participaciones<input name="qty" type="number" step="any" min="0" required /></label>
           </div>
           <label>Precio medio de compra (en €)<input name="avg" type="number" step="any" min="0" required /></label>
+          <label>Fecha de compra (opcional)<input name="date" type="date" /></label>
           <div className="row" style={{ justifyContent: "flex-end", marginTop: 6 }}>
             <button type="button" className="ghost" onClick={() => dlg.current?.close()}>Cancelar</button>
             <button className="btn" type="submit">Guardar</button>

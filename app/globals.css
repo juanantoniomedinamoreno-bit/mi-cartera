@@ -39,3 +39,5 @@ label{display:grid;gap:4px;font-size:13px;color:var(--muted)}
 form input,form select{background:var(--input);border:1px solid var(--line);border-radius:8px;padding:9px 10px;width:100%}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .note{color:var(--muted);font-size:12px;margin-top:14px}
+.insights{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
+.insight{border:1px solid var(--line);border-radius:12px;padding:12px 14px}
