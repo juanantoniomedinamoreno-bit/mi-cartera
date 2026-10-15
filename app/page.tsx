@@ -5,13 +5,13 @@ import { getFb } from "@/lib/firebase";
 import { guessType } from "@/lib/market";
 import { GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut, type User } from "firebase/auth";
 import { doc, getDoc, setDoc } from "firebase/firestore";
-import { analyze, buildSeries, type Account, type Hist, type Live, type Point, type Position } from "@/lib/analysis";
+import { analyze, buildSeries, consolidate, mergeImport, mergeManual, replay, type Account, type Hist, type Live, type Point, type Position } from "@/lib/analysis";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const KEY = "gq_positions_v2";
 const KEYA = "gq_accounts_v1";
 const MAIN: Account = { id: "main", name: "Principal" };
-const fixPositions = (ps: Position[]): Position[] => ps.map((p) => ({ ...p, accountId: p.accountId ?? "main" }));
+const fixPositions = (ps: Position[]): Position[] => consolidate(ps.map((p) => ({ ...p, accountId: p.accountId ?? "main" })));
 const ensureAccounts = (accs: Account[], ps: Position[]): Account[] => {
   const out = accs.length ? [...accs] : [MAIN];
   for (const p of ps) if (!out.some((a) => a.id === p.accountId)) out.push({ id: p.accountId, name: p.accountId === "main" ? "Principal" : "Cartera" });
@@ -142,39 +142,59 @@ export default function Home() {
     const f = e.target.files?.[0];
     e.target.value = "";
     if (!f) return;
-    const buf = await f.arrayBuffer();
-    let text = new TextDecoder("utf-8").decode(buf);
-    if (text.includes("\uFFFD")) text = new TextDecoder("windows-1252").decode(buf);
+    if (/\.xlsx?$/i.test(f.name)) {
+      setImportMsg("Este archivo es de Excel. Ábrelo y guárdalo como CSV (Archivo → Guardar como → CSV) y súbelo de nuevo.");
+      return;
+    }
+    const buf = new Uint8Array(await f.arrayBuffer());
+    let enc = "utf-8";
+    if (buf[0] === 0xff && buf[1] === 0xfe) enc = "utf-16le";
+    else if (buf[0] === 0xfe && buf[1] === 0xff) enc = "utf-16be";
+    let text = new TextDecoder(enc).decode(buf);
+    if (enc === "utf-8" && text.includes("\uFFFD")) text = new TextDecoder("windows-1252").decode(buf);
     const res = parseCsv(text);
     if (res.error) { setImportMsg(res.error); return; }
+
     let accs = [...accounts];
     const target = tab !== "all" && accs.some((a) => a.id === tab) ? tab : accs[0]?.id ?? "main";
-    const autos: { id: string; symbol: string; typeAuto: boolean; nameAuto: boolean }[] = [];
-    const mapped: Position[] = res.positions.map(({ account, typeAuto, nameAuto, ...p }) => {
+    const autos = new Map<string, { typeAuto: boolean; nameAuto: boolean }>();
+    const incoming: Position[] = res.positions.map((ip) => {
       let accountId = target;
-      if (account) {
-        let a = accs.find((x) => x.name.toLowerCase() === account.toLowerCase());
-        if (!a) { a = { id: crypto.randomUUID(), name: account }; accs = [...accs, a]; }
+      if (ip.account) {
+        let a = accs.find((x) => x.name.toLowerCase() === ip.account!.toLowerCase());
+        if (!a) { a = { id: crypto.randomUUID(), name: ip.account }; accs = [...accs, a]; }
         accountId = a.id;
       }
-      const id = crypto.randomUUID();
-      if (typeAuto || nameAuto) autos.push({ id, symbol: p.symbol, typeAuto: !!typeAuto, nameAuto: !!nameAuto });
-      return { ...p, accountId, id };
+      if (ip.typeAuto || ip.nameAuto) autos.set(ip.symbol, { typeAuto: ip.typeAuto, nameAuto: ip.nameAuto });
+      const { qty, avg } = replay(ip.lots);
+      return { id: crypto.randomUUID(), accountId, symbol: ip.symbol, name: ip.name, type: ip.type, qty, avg, price: ip.current ?? avg, lots: ip.lots };
     });
+    const m = mergeImport(positions, incoming, res.kind);
     setAccounts(accs);
-    setPositions((prev) => [...prev, ...mapped]);
-    setImportMsg(`Se importaron ${res.positions.length} posiciones` + (res.skipped ? ` (${res.skipped} filas ignoradas por datos incompletos)` : "") + ".");
-    if (autos.length) {
-      const info = await lookup([...new Set(autos.map((a) => a.symbol))]);
+    setPositions(m.positions);
+
+    const parts = [`${res.positions.length} posiciones leídas`];
+    if (m.added) parts.push(`${m.added} nuevas`);
+    if (m.updated) parts.push(`${m.updated} actualizadas`);
+    if (res.kind === "transactions") parts.unshift("Historial de operaciones: compras y ventas agrupadas por activo con precio medio");
+    if (res.closed) parts.push(`${res.closed} ya vendidas por completo`);
+    if (m.dup) parts.push(`${m.dup} operaciones repetidas ignoradas`);
+    if (res.otherOps) parts.push(`${res.otherOps} filas que no son compras ni ventas ignoradas`);
+    if (res.skipped) parts.push(`${res.skipped} filas incompletas ignoradas`);
+    setImportMsg(parts.join(" · ") + "." + (res.warnings.length ? " " + res.warnings.join(" ") : ""));
+
+    if (autos.size) {
+      const info = await lookup([...autos.keys()]);
       setPositions((prev) => prev.map((p) => {
-        const a = autos.find((x) => x.id === p.id), d = a && info[a.symbol];
-        return a && d ? { ...p, type: a.typeAuto ? d.type : p.type, name: a.nameAuto ? d.name : p.name } : p;
+        const d = info[p.symbol], f = autos.get(p.symbol);
+        if (!d || !f) return p;
+        return { ...p, type: f.typeAuto ? d.type : p.type, name: f.nameAuto && (!p.name || p.name === p.symbol) ? d.name : p.name };
       }));
     }
   }
 
   function downloadTemplate() {
-    const csv = "\uFEFFSímbolo;Cantidad;Precio medio;Fecha compra;Cuenta\nAAPL;10;150,50;2024-03-15;Degiro\nIE00B03HCZ61;25,5;42,10;15/06/2023;MyInvestor\nBTC;0,05;30000;2023-01-10;Cripto\n";
+    const csv = "\uFEFFSímbolo;Cantidad;Precio medio;Fecha compra;Cuenta\nAAPL;10;150,50;2024-03-15;Degiro\nAAPL;5;165,00;2024-06-20;Degiro\nIE00B03HCZ61;25,5;42,10;15/06/2023;MyInvestor\nBTC;0,05;30000;2023-01-10;Cripto\n";
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
     a.download = "plantilla-cartera.csv";
@@ -299,11 +319,11 @@ export default function Home() {
       info = r[symbol] ? { q: symbol, name: r[symbol].name, type: r[symbol].type, found: true } : { q: symbol, name: symbol, type: guessType(symbol), found: false };
     }
     const type = info.found ? info.type : manualType || info.type;
-    setPositions((prev) => [...prev, {
+    setPositions((prev) => mergeManual(prev, {
       id: crypto.randomUUID(), accountId: String(d.get("account") || accounts[0]?.id || "main"),
       symbol, name: info.name, type, qty, avg, price: avg,
       buyDate: String(d.get("date") || "") || undefined,
-    }]);
+    }));
     form.reset();
     closeDlg();
   }
@@ -340,7 +360,7 @@ export default function Home() {
               {fbOn && user && <button onClick={(e) => { closeMenu(e); logout(); }}>Cerrar sesión</button>}
             </div>
           </details>
-          <input ref={fileRef} type="file" accept=".csv,text/csv" hidden onChange={onFile} />
+          <input ref={fileRef} type="file" accept=".csv,.tsv,.txt,text/csv,text/plain" hidden onChange={onFile} />
         </div>
       </header>
 

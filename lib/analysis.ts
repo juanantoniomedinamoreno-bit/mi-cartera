@@ -1,10 +1,73 @@
 export type Account = { id: string; name: string };
-export type Position = { id: string; accountId: string; symbol: string; name: string; type: string; qty: number; avg: number; price: number; buyDate?: string };
+export type Position = { id: string; accountId: string; symbol: string; name: string; type: string; qty: number; avg: number; price: number; buyDate?: string; lots?: Lot[] };
 export type Live = Record<string, { price: number; change24h?: number }>;
 export type Hist = Record<string, { t: number[]; p: number[] }>;
 export type Point = { d: string; value: number; invested: number };
 
 const day = (s: number) => new Date(s * 1000).toISOString().slice(0, 10);
+
+export type Lot = { d?: string; q: number; p: number };
+
+// Aplica una operación con el método de coste medio: las ventas no cambian el precio medio.
+export function applyLot(qty: number, cost: number, l: Lot) {
+  if (l.q >= 0) return { qty: qty + l.q, cost: cost + l.q * l.p };
+  if (qty <= 0) return { qty, cost };
+  const take = Math.min(-l.q, qty);
+  return { qty: qty - take, cost: cost - take * (cost / qty) };
+}
+const byDate = (a: Lot, b: Lot) => (a.d ?? "").localeCompare(b.d ?? "");
+export function replay(lots: Lot[]) {
+  let qty = 0, cost = 0;
+  for (const l of [...lots].sort(byDate)) ({ qty, cost } = applyLot(qty, cost, l));
+  qty = Math.round(qty * 1e8) / 1e8;
+  return { qty, avg: qty > 1e-9 ? cost / qty : 0 };
+}
+export const lotsOf = (p: Position): Lot[] => (p.lots?.length ? p.lots : [{ d: p.buyDate, q: p.qty, p: p.avg }]);
+export function withLots(p: Position, lots: Lot[]): Position {
+  const { qty, avg } = replay(lots);
+  const dated = lots.map((l) => l.d).filter(Boolean).sort()[0];
+  return { ...p, lots, qty, avg, buyDate: dated };
+}
+
+// Junta las posiciones repetidas (mismo activo y misma cartera) recalculando cantidad y precio medio.
+export function consolidate(ps: Position[]): Position[] {
+  const out: Position[] = [];
+  for (const p of ps) {
+    const i = out.findIndex((x) => x.accountId === p.accountId && x.symbol === p.symbol);
+    if (i < 0) out.push(p);
+    else out[i] = withLots(out[i], [...lotsOf(out[i]), ...lotsOf(p)]);
+  }
+  return out;
+}
+
+// Añade una compra a mano: si ya existe ese activo en la cartera, se junta y se recalcula el precio medio.
+export function mergeManual(prev: Position[], n: Position): Position[] {
+  const lot: Lot = { d: n.buyDate, q: n.qty, p: n.avg };
+  const i = prev.findIndex((p) => p.accountId === n.accountId && p.symbol === n.symbol);
+  if (i < 0) return [...prev, { ...n, lots: [lot] }];
+  return prev.map((p, k) => (k === i ? withLots(p, [...lotsOf(p), lot]) : p));
+}
+
+// Importación: una foto de la cartera sustituye al activo existente; un historial de operaciones se suma sin duplicar.
+export function mergeImport(prev: Position[], inc: Position[], kind: "snapshot" | "transactions") {
+  let added = 0, updated = 0, dup = 0;
+  let out = [...prev];
+  for (const n of inc) {
+    const i = out.findIndex((p) => p.accountId === n.accountId && p.symbol === n.symbol);
+    if (i < 0) { out.push(n); added++; continue; }
+    const old = out[i];
+    if (kind === "snapshot") { out[i] = { ...withLots(old, n.lots ?? lotsOf(n)), price: n.price }; updated++; continue; }
+    const have = [...lotsOf(old)], add: Lot[] = [];
+    for (const l of n.lots ?? lotsOf(n)) {
+      const k = have.findIndex((h) => (h.d ?? "") === (l.d ?? "") && h.q === l.q && h.p === l.p);
+      if (k > -1) { have.splice(k, 1); dup++; } else add.push(l);
+    }
+    if (add.length) { out[i] = withLots(old, [...lotsOf(old), ...add]); updated++; }
+  }
+  const before = out.length;
+  out = out.filter((p) => p.qty > 1e-9);
+  return { positions: out, added, updated, dup, closed: before - out.length };
+}
 
 export function buildSeries(positions: Position[], hist: Hist) {
   const maps: Record<string, Map<string, number>> = {};
@@ -17,15 +80,17 @@ export function buildSeries(positions: Position[], hist: Hist) {
     h.t.forEach((t, i) => { const k = day(t); m.set(k, h.p[i]); days.add(k); });
     maps[sym] = m;
   }
+  const st = positions.map((p) => ({ sym: p.symbol, ev: [...lotsOf(p)].sort(byDate), i: 0, qty: 0, cost: 0 }));
   const last: Record<string, number> = {};
   const points: Point[] = [];
   for (const d of [...days].sort()) {
     for (const sym in maps) { const v = maps[sym].get(d); if (v !== undefined) last[sym] = v; }
     let value = 0, invested = 0;
-    for (const p of positions) {
-      if (last[p.symbol] === undefined || (p.buyDate && p.buyDate > d)) continue;
-      value += p.qty * last[p.symbol];
-      invested += p.qty * p.avg;
+    for (const x of st) {
+      while (x.i < x.ev.length && (x.ev[x.i].d ?? "") <= d) { ({ qty: x.qty, cost: x.cost } = applyLot(x.qty, x.cost, x.ev[x.i])); x.i++; }
+      if (last[x.sym] === undefined || x.qty <= 1e-9) continue;
+      value += x.qty * last[x.sym];
+      invested += x.cost;
     }
     if (invested > 0) points.push({ d, value, invested });
   }
