@@ -49,3 +49,32 @@ export async function toEur(currency: string): Promise<number> {
   if (!(cur in fxCache)) fxCache[cur] = (await yahooQuote(`${cur}EUR=X`))?.price ?? NaN;
   return pence ? fxCache[cur] / 100 : fxCache[cur];
 }
+
+export const CRYPTO_NAMES: Record<string, string> = {
+  BTC: "Bitcoin", ETH: "Ethereum", SOL: "Solana", ADA: "Cardano", DOT: "Polkadot", AVAX: "Avalanche",
+  MATIC: "Polygon", LINK: "Chainlink", XRP: "XRP", DOGE: "Dogecoin", LTC: "Litecoin", BNB: "BNB",
+};
+const QUOTE_TYPES: Record<string, string> = { EQUITY: "Acción", ETF: "ETF", MUTUALFUND: "Fondo de inversión", CRYPTOCURRENCY: "Cripto" };
+
+export function guessType(symbol: string): string {
+  return CRYPTO[symbol] ? "Cripto" : ISIN.test(symbol) ? "Fondo de inversión" : "Acción";
+}
+
+// Busca el activo en Yahoo y devuelve su nombre y tipo (acción, ETF, fondo, cripto).
+export async function lookupAsset(raw: string): Promise<{ name: string; type: string } | null> {
+  const q = raw.trim().toUpperCase();
+  if (!q) return null;
+  if (CRYPTO[q]) return { name: CRYPTO_NAMES[q] ?? q, type: "Cripto" };
+  try {
+    const res = await fetch(
+      `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=8&newsCount=0`,
+      { headers: HEADERS, cache: "no-store" }
+    );
+    const quotes: { symbol?: string; shortname?: string; longname?: string; quoteType?: string }[] = (await res.json())?.quotes ?? [];
+    const pick = quotes.find((x) => x.symbol?.toUpperCase() === q) ?? quotes.find((x) => x.quoteType && QUOTE_TYPES[x.quoteType]) ?? quotes[0];
+    if (!pick) return null;
+    return { name: pick.longname || pick.shortname || q, type: QUOTE_TYPES[pick.quoteType ?? ""] ?? "Otro" };
+  } catch {
+    return null;
+  }
+}

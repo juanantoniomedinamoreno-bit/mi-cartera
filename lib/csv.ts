@@ -1,7 +1,7 @@
 import type { Position } from "./analysis";
 import { CRYPTO, ISIN } from "./market";
 
-type NewPosition = Omit<Position, "id" | "accountId"> & { account?: string };
+type NewPosition = Omit<Position, "id" | "accountId"> & { account?: string; typeAuto?: boolean; nameAuto?: boolean };
 
 const ALIASES: Record<string, string[]> = {
   symbol: ["simbolo", "symbol", "ticker", "isin", "codigo", "codigoisin"],
@@ -93,6 +93,8 @@ export function parseCsv(input: string): { positions: NewPosition[]; skipped: nu
       symbol, qty, avg, price: avg,
       name: (col.name !== undefined ? (r[col.name] ?? "").trim() : "") || symbol,
       type: type(col.type !== undefined ? r[col.type] ?? "" : "", symbol),
+      typeAuto: col.type === undefined || !(r[col.type] ?? "").trim(),
+      nameAuto: col.name === undefined || !(r[col.name] ?? "").trim(),
       account: col.account !== undefined ? (r[col.account] ?? "").trim() || undefined : undefined,
       buyDate: col.date !== undefined ? date(r[col.date] ?? "") : undefined,
     });
