@@ -46,7 +46,18 @@ export default function Home() {
   const [positions, setPositions] = useState<Position[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([MAIN]);
   const [tab, setTab] = useState("all");
-  const [live, setLive] = useState<Live>({});
+  const [liveRaw, setLive] = useState<Live>({});
+  // Si el precio en vivo difiere mucho del último precio del archivo importado, se asume que se encontró otro activo y se descarta.
+  const live = useMemo(() => {
+    const o: Live = {};
+    for (const p of positions) {
+      const l = liveRaw[p.symbol];
+      if (!l || o[p.symbol]) continue;
+      if (p.ref && (l.price / p.ref > 2.5 || l.price / p.ref < 0.4)) continue;
+      o[p.symbol] = l;
+    }
+    return o;
+  }, [positions, liveRaw]);
   const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [updated, setUpdated] = useState<Date | null>(null);
@@ -178,7 +189,7 @@ export default function Home() {
         if (r) { symbol = r.symbol; if (ip.typeAuto) type = r.type; } else unresolved.push(ip.name);
       } else if (ip.typeAuto || ip.nameAuto) autos.set(symbol, { typeAuto: ip.typeAuto, nameAuto: ip.nameAuto });
       const { qty, avg } = replay(ip.lots);
-      return { id: crypto.randomUUID(), accountId, symbol, name: ip.name, type, qty, avg, price: ip.current ?? avg, lots: ip.lots };
+      return { id: crypto.randomUUID(), accountId, symbol, name: ip.name, type, qty, avg, price: ip.current ?? avg, ref: ip.ref, lots: ip.lots };
     });
     const incoming = consolidate(mapped);
     const m = mergeImport(positions, incoming, res.kind);
@@ -193,7 +204,7 @@ export default function Home() {
     if (m.dup) parts.push(`${m.dup} operaciones repetidas ignoradas`);
     if (res.otherOps) parts.push(`${res.otherOps} filas que no son compras ni ventas ignoradas`);
     if (res.skipped) parts.push(`${res.skipped} filas incompletas ignoradas`);
-    if (unresolved.length) parts.push(`no pude identificar: ${unresolved.slice(0, 5).join(", ")}${unresolved.length > 5 ? "…" : ""} (revisa el nombre o usa el ISIN)`);
+    if (unresolved.length) parts.push(`sin precio en vivo (no los encontré por nombre; se usa el último precio del archivo): ${unresolved.slice(0, 4).join("; ")}${unresolved.length > 4 ? "…" : ""}`);
     setImportMsg(parts.join(" · ") + "." + (res.warnings.length ? " " + res.warnings.join(" ") : ""));
 
     if (autos.size) {
@@ -256,7 +267,7 @@ export default function Home() {
     setTab("all");
   }
 
-  const symbolsKey = useMemo(() => [...new Set(positions.map((p) => p.symbol))].sort().join(","), [positions]);
+  const symbolsKey = useMemo(() => [...new Set(positions.map((p) => p.symbol).filter((s) => /^[A-Za-z0-9.^=\-]{1,24}$/.test(s)))].sort().join(","), [positions]);
 
   const refresh = useCallback(async () => {
     if (!symbolsKey) return;
@@ -288,7 +299,7 @@ export default function Home() {
     return () => { cancelled = true; };
   }, [loaded, symbolsKey, range]);
 
-  const series = useMemo(() => buildSeries(view, hist), [view, hist]);
+  const series = useMemo(() => buildSeries(view, Object.fromEntries(Object.entries(hist).filter(([s]) => !(liveRaw[s] && !live[s])))), [view, hist, liveRaw, live]);
   const insights = useMemo(() => analyze(view, live, series.points, accounts), [view, live, series.points, accounts]);
 
   const priceOf = (p: Position) => live[p.symbol]?.price ?? p.price;
@@ -476,7 +487,7 @@ export default function Home() {
                             <div className="av" style={{ background: COLORS[hash(p.symbol) % COLORS.length] }}>{p.symbol.slice(0, 2)}</div>
                             <div>
                               <div className="sym">{p.name !== p.symbol ? p.name : p.symbol}</div>
-                              <div className="nm">{p.symbol} · {p.type}{activeTab === "all" && accounts.length > 1 && <span className="badge">{accName(p.accountId)}</span>}</div>
+                              <div className="nm">{/^[A-Za-z0-9.^=\-]{1,24}$/.test(p.symbol) ? `${p.symbol} · ` : ""}{p.type}{activeTab === "all" && accounts.length > 1 && <span className="badge">{accName(p.accountId)}</span>}</div>
                             </div>
                           </div>
                         </td>

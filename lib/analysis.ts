@@ -1,5 +1,5 @@
 export type Account = { id: string; name: string };
-export type Position = { id: string; accountId: string; symbol: string; name: string; type: string; qty: number; avg: number; price: number; buyDate?: string; lots?: Lot[] };
+export type Position = { id: string; accountId: string; symbol: string; name: string; type: string; qty: number; avg: number; price: number; buyDate?: string; lots?: Lot[]; ref?: number };
 export type Live = Record<string, { price: number; change24h?: number }>;
 export type Hist = Record<string, { t: number[]; p: number[] }>;
 export type Point = { d: string; value: number; invested: number };
@@ -56,13 +56,13 @@ export function mergeImport(prev: Position[], inc: Position[], kind: "snapshot" 
     const i = out.findIndex((p) => p.accountId === n.accountId && p.symbol === n.symbol);
     if (i < 0) { out.push(n); added++; continue; }
     const old = out[i];
-    if (kind === "snapshot") { out[i] = { ...withLots(old, n.lots ?? lotsOf(n)), price: n.price }; updated++; continue; }
+    if (kind === "snapshot") { out[i] = { ...withLots(old, n.lots ?? lotsOf(n)), price: n.price, ref: n.ref ?? old.ref }; updated++; continue; }
     const have = [...lotsOf(old)], add: Lot[] = [];
     for (const l of n.lots ?? lotsOf(n)) {
       const k = have.findIndex((h) => (h.d ?? "") === (l.d ?? "") && h.q === l.q && h.p === l.p);
       if (k > -1) { have.splice(k, 1); dup++; } else add.push(l);
     }
-    if (add.length) { out[i] = withLots(old, [...lotsOf(old), ...add]); updated++; }
+    if (add.length) { out[i] = { ...withLots(old, [...lotsOf(old), ...add]), ref: n.ref ?? old.ref, price: n.price ?? old.price }; updated++; }
   }
   const before = out.length;
   out = out.filter((p) => p.qty > 1e-9);

@@ -3,7 +3,7 @@ import { CRYPTO, ISIN } from "./market";
 
 export type ImportedPosition = {
   symbol: string; name: string; type: string; account?: string; lots: Lot[];
-  current?: number; typeAuto: boolean; nameAuto: boolean; needsResolve?: boolean;
+  current?: number; ref?: number; typeAuto: boolean; nameAuto: boolean; needsResolve?: boolean;
 };
 export type ParseResult = {
   positions: ImportedPosition[]; kind: "snapshot" | "transactions";
@@ -22,7 +22,7 @@ const A = {
   avg: ["preciomedio", "coste", "costo", "costemedio", "preciocoste", "precioadquisicion", "preciodeadquisicion", "preciomediocompra", "preciomediodecompra", "avgprice", "avg", "averageprice", "avgcost", "costemedio", "costepromedio", "preciopromedio", "pmc", "preciodecompra", "preciocompra", "buyprice", "openprice", "preciodeapertura", "costeunitario"],
   price: ["precio", "price", "valorliquidativo", "vl", "unitprice", "preciounitario", "preciodeejecucion", "executionprice", "pricepershare", "preciopor", "preciopoaccion", "cotizacion"],
   current: ["cierre", "preciodecierre", "closeprice", "currentprice", "lastprice", "preciodemercado", "marketprice", "precioactual", "ultimoprecio"],
-  amount: ["importe", "total", "amount", "importetotal", "totalamount", "proceeds", "importeneto", "importebruto", "valorlocal", "efectivo", "costetotal"],
+  amount: ["valornetodetransaccion", "valornetotransaccion", "importe", "total", "amount", "importetotal", "totalamount", "proceeds", "importeneto", "importebruto", "valorlocal", "efectivo", "costetotal"],
   date: ["fechaoperacion", "fechadeoperacion", "fechaejecucion", "fechadecompra", "fechacompra", "fecha", "date", "datetime", "tradedate", "opentime", "buydate", "timestamp", "time", "fechadecontratacion"],
   account: ["cuenta", "account", "broker", "cartera", "banco", "entidad"],
   currency: ["divisa", "currency", "ccy", "monedadeoperacion"],
@@ -108,6 +108,8 @@ function parseDate(s: string): string | undefined {
 function opKind(v: string): "buy" | "sell" | "other" | null {
   const t = norm(v);
   if (!t) return null;
+  if (/entrant|incoming|transferin|traspasoentrada|recibid/.test(t)) return "buy";
+  if (/salient|outgoing|transferout|traspasosalida|enviad/.test(t)) return "sell";
   if (/buy|compra|suscrip|purchase|aportac/.test(t)) return "buy";
   if (/sell|venta|vender|reembols|rescate|sold/.test(t)) return "sell";
   return "other";
@@ -218,9 +220,31 @@ export function parseCsv(input: string): ParseResult {
   const byName = tickerCol < 0 && isinCol < 0 && combCol < 0;
   if (byName && find(A.name) < 0) return fail(`No encuentro ninguna columna con el símbolo, el ISIN o el nombre del activo. Columnas que veo: ${shown}.`);
   if (byName) warnings.push("El archivo no trae símbolo ni ISIN: busco cada activo por su nombre.");
-  const qtyCol = find(A.qty);
+  const avgCol = find(A.avg), priceCol = find(A.price), curCol = find(A.current);
+  let amtCol = find(A.amount);
+  // Si hay varias columnas que podrían ser la cantidad (p. ej. "Títulos" y "Cantidad", donde esta última es el importe),
+  // se elige la que cumple cantidad × precio ≈ importe.
+  let qtyCol = find(A.qty);
+  const qtyCands = head.map((h, i) => (A.qty.includes(h) ? i : -1)).filter((i) => i > -1);
+  const pc = priceCol > -1 ? priceCol : avgCol;
+  if (qtyCands.length > 1 && pc > -1) {
+    const nv = (r: string[], c: number) => num((r[c] ?? "").trim(), commaDecimal);
+    let bestShare = 0;
+    for (const q of qtyCands) {
+      const others = [...qtyCands.filter((c) => c !== q), amtCol].filter((c) => c > -1);
+      let ok = 0, tot = 0;
+      for (const r of body) {
+        const qv = nv(r, q), pv = nv(r, pc);
+        if (!Number.isFinite(qv) || !Number.isFinite(pv)) continue;
+        tot++;
+        if (others.some((o) => { const ov = nv(r, o); return Number.isFinite(ov) && Math.abs(Math.abs(qv * pv) - Math.abs(ov)) <= Math.max(0.02 * Math.abs(ov), 0.05); })) ok++;
+      }
+      const sh = tot ? ok / tot : 0;
+      if (sh > bestShare) { bestShare = sh; qtyCol = q; }
+    }
+    if (amtCol < 0) amtCol = qtyCands.find((c) => c !== qtyCol) ?? -1;
+  }
   if (qtyCol < 0) return fail(`No encuentro la columna de cantidad. Columnas que veo: ${shown}.`);
-  const avgCol = find(A.avg), priceCol = find(A.price), curCol = find(A.current), amtCol = find(A.amount);
   if ([avgCol, priceCol, curCol, amtCol, eurCol].every((c) => c < 0)) return fail(`No encuentro ninguna columna de precio o importe. Columnas que veo: ${shown}.`);
   const nameCol = find(A.name), dateCol = find(A.date), accCol = find(A.account), curCcyCol = find(A.currency);
 
@@ -240,7 +264,10 @@ export function parseCsv(input: string): ParseResult {
   let skipped = 0, otherOps = 0, foreign = 0, usedCurrent = 0;
   const groups = new Map<string, ImportedPosition>();
 
-  for (const r of body) {
+  // Muchos brokers exportan lo más reciente arriba: se recorre en orden cronológico para que las operaciones del mismo día se apliquen bien.
+  const dated = dateCol > -1 ? body.map((r) => parseDate((r[dateCol] ?? "").trim())).filter(Boolean) as string[] : [];
+  const descending = dated.length > 1 && dated[0] > dated[dated.length - 1];
+  for (const r of descending ? [...body].reverse() : body) {
     const cell = (c: number) => (c > -1 ? (r[c] ?? "").trim() : "");
     const symbol = byName ? cell(nameCol).toUpperCase().replace(/\s+/g, " ") : cleanSymbol(cell(tickerCol) || cell(isinCol) || cell(combCol));
     if (!symbol) { skipped++; continue; }
@@ -286,7 +313,14 @@ export function parseCsv(input: string): ParseResult {
 
   let closed = 0;
   const positions: ImportedPosition[] = [];
-  groups.forEach((g) => { if (replay(g.lots).qty > 1e-9) positions.push(g); else closed++; });
+  groups.forEach((g) => {
+    if (kind === "transactions") {
+      let best: Lot | undefined;
+      for (const l of g.lots) if (l.d && (!best || l.d > best.d!)) best = l;
+      if (best) { g.ref = best.p; if (g.current === undefined) g.current = best.p; }
+    }
+    if (replay(g.lots).qty > 1e-9) positions.push(g); else closed++;
+  });
 
   if (!positions.length) return fail(`No he podido leer ninguna posición. Columnas que veo: ${shown}.`);
   if (foreign) warnings.push(`${foreign} filas están en una divisa distinta del euro: el precio se tomó tal cual, sin convertir.`);

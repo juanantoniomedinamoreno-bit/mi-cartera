@@ -109,7 +109,9 @@ export async function lookupAsset(raw: string): Promise<Found | null> {
   const byName = /\s/.test(q) || (q.length > 12 && !ISIN.test(upper));
   if (!byName) return searchOnce(q, false, upper);
   const words = q.replace(/[.,()]/g, " ").replace(/\s+/g, " ").trim().split(" ");
-  const variants = [...new Set([words.join(" "), words.slice(0, 4).join(" "), words.slice(0, 2).join(" ")])].filter((v) => v.length >= 3);
+  const noise = /^(s|sa|sl|slu|inc|corp|ltd|plc|ag|nv|se|ie|acc|dist|eur|usd|gbp|clase|class|fund|fondo|r|p|s|a|b|c|d|i)$/i;
+  const core = words.filter((w) => !noise.test(w) && !/^[A-Za-z]-?acc/i.test(w));
+  const variants = [...new Set([words.join(" "), core.join(" "), core.slice(0, 4).join(" "), core.slice(0, 3).join(" "), core.slice(0, 2).join(" ")])].filter((v) => v.length >= 3);
   for (const v of variants) {
     const r = await searchOnce(v, true, upper);
     if (r) return r;
