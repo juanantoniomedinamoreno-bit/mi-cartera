@@ -60,21 +60,59 @@ export function guessType(symbol: string): string {
   return CRYPTO[symbol] ? "Cripto" : ISIN.test(symbol) ? "Fondo de inversión" : "Acción";
 }
 
-// Busca el activo en Yahoo y devuelve su nombre y tipo (acción, ETF, fondo, cripto).
-export async function lookupAsset(raw: string): Promise<{ name: string; type: string } | null> {
-  const q = raw.trim().toUpperCase();
-  if (!q) return null;
-  if (CRYPTO[q]) return { name: CRYPTO_NAMES[q] ?? q, type: "Cripto" };
+type Found = { name: string; type: string; symbol: string; exact: boolean };
+type YQuote = { symbol?: string; shortname?: string; longname?: string; quoteType?: string };
+const tokens = (t: string) => new Set(t.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").split(/[^a-z0-9]+/).filter((w) => w.length > 1));
+
+async function searchOnce(q: string, byName: boolean, upper: string): Promise<Found | null> {
   try {
     const res = await fetch(
-      `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=8&newsCount=0`,
+      `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=10&newsCount=0`,
       { headers: HEADERS, cache: "no-store" }
     );
-    const quotes: { symbol?: string; shortname?: string; longname?: string; quoteType?: string }[] = (await res.json())?.quotes ?? [];
-    const pick = quotes.find((x) => x.symbol?.toUpperCase() === q) ?? quotes.find((x) => x.quoteType && QUOTE_TYPES[x.quoteType]) ?? quotes[0];
-    if (!pick) return null;
-    return { name: pick.longname || pick.shortname || q, type: QUOTE_TYPES[pick.quoteType ?? ""] ?? "Otro" };
+    const quotes: YQuote[] = (await res.json())?.quotes ?? [];
+    const typed = quotes.filter((x) => x.quoteType && QUOTE_TYPES[x.quoteType]);
+    let pick: YQuote | undefined;
+    if (byName) {
+      const want = tokens(q);
+      let best = -1;
+      for (const x of typed) {
+        const have = tokens(`${x.longname ?? ""} ${x.shortname ?? ""}`);
+        let score = 0;
+        want.forEach((w) => { if (have.has(w)) score++; });
+        if (score > best) { best = score; pick = x; }
+      }
+      if (best < 1) pick = undefined;
+    } else {
+      pick = quotes.find((x) => x.symbol?.toUpperCase() === upper) ?? typed[0] ?? quotes[0];
+    }
+    if (!pick?.symbol) return null;
+    return {
+      name: pick.longname || pick.shortname || q,
+      type: QUOTE_TYPES[pick.quoteType ?? ""] ?? "Otro",
+      symbol: pick.symbol,
+      exact: pick.symbol.toUpperCase() === upper,
+    };
   } catch {
     return null;
   }
+}
+
+// Busca el activo por símbolo, ISIN o nombre y devuelve su nombre, tipo y símbolo de mercado.
+export async function lookupAsset(raw: string): Promise<Found | null> {
+  const q = raw.trim().replace(/\s+/g, " ");
+  const upper = q.toUpperCase();
+  if (!q) return null;
+  if (CRYPTO[upper]) return { name: CRYPTO_NAMES[upper] ?? upper, type: "Cripto", symbol: upper, exact: true };
+  const byCryptoName = Object.entries(CRYPTO_NAMES).find(([, n]) => n.toLowerCase() === q.toLowerCase());
+  if (byCryptoName) return { name: byCryptoName[1], type: "Cripto", symbol: byCryptoName[0], exact: false };
+  const byName = /\s/.test(q) || (q.length > 12 && !ISIN.test(upper));
+  if (!byName) return searchOnce(q, false, upper);
+  const words = q.replace(/[.,()]/g, " ").replace(/\s+/g, " ").trim().split(" ");
+  const variants = [...new Set([words.join(" "), words.slice(0, 4).join(" "), words.slice(0, 2).join(" ")])].filter((v) => v.length >= 3);
+  for (const v of variants) {
+    const r = await searchOnce(v, true, upper);
+    if (r) return r;
+  }
+  return null;
 }

@@ -3,7 +3,7 @@ import { CRYPTO, ISIN } from "./market";
 
 export type ImportedPosition = {
   symbol: string; name: string; type: string; account?: string; lots: Lot[];
-  current?: number; typeAuto: boolean; nameAuto: boolean;
+  current?: number; typeAuto: boolean; nameAuto: boolean; needsResolve?: boolean;
 };
 export type ParseResult = {
   positions: ImportedPosition[]; kind: "snapshot" | "transactions";
@@ -16,10 +16,10 @@ const A = {
   ticker: ["simbolo", "symbol", "ticker", "codigo", "asset", "coin", "instrumento", "valorticker"],
   isin: ["isin", "codigoisin"],
   combined: ["simboloisin", "symbolisin", "isinsimbolo"],
-  name: ["nombre", "name", "descripcion", "producto", "activo", "fondo", "security", "titulo", "denominacion", "nombredelactivo", "nombredelfondo"],
+  name: ["nombre", "producto", "empresa", "company", "valordescripcion", "valorsubyacente", "name", "descripcion", "producto", "activo", "fondo", "security", "titulo", "denominacion", "nombredelactivo", "nombredelfondo"],
   type: ["tipo", "type", "tipodeoperacion", "operacion", "transaction", "transactiontype", "accion", "side", "direccion", "movimiento", "concepto", "clase", "categoria", "tipodeactivo", "tipodeproducto", "assetclass", "clasedeactivo", "producttype"],
-  qty: ["cantidad", "quantity", "qty", "participaciones", "numerodeparticipaciones", "acciones", "shares", "unidades", "titulos", "numero", "volume", "volumen", "nominal", "number", "nacciones", "numtitulos"],
-  avg: ["preciomedio", "preciomediocompra", "preciomediodecompra", "avgprice", "avg", "averageprice", "avgcost", "costemedio", "costepromedio", "preciopromedio", "pmc", "preciodecompra", "preciocompra", "buyprice", "openprice", "preciodeapertura", "costeunitario"],
+  qty: ["cantidad", "uds", "unid", "titulosnumero", "cant", "quantity", "qty", "participaciones", "numerodeparticipaciones", "acciones", "shares", "unidades", "titulos", "numero", "volume", "volumen", "nominal", "number", "nacciones", "numtitulos"],
+  avg: ["preciomedio", "coste", "costo", "costemedio", "preciocoste", "precioadquisicion", "preciodeadquisicion", "preciomediocompra", "preciomediodecompra", "avgprice", "avg", "averageprice", "avgcost", "costemedio", "costepromedio", "preciopromedio", "pmc", "preciodecompra", "preciocompra", "buyprice", "openprice", "preciodeapertura", "costeunitario"],
   price: ["precio", "price", "valorliquidativo", "vl", "unitprice", "preciounitario", "preciodeejecucion", "executionprice", "pricepershare", "preciopor", "preciopoaccion", "cotizacion"],
   current: ["cierre", "preciodecierre", "closeprice", "currentprice", "lastprice", "preciodemercado", "marketprice", "precioactual", "ultimoprecio"],
   amount: ["importe", "total", "amount", "importetotal", "totalamount", "proceeds", "importeneto", "importebruto", "valorlocal", "efectivo", "costetotal"],
@@ -124,11 +124,48 @@ function assetType(raw: string): string {
 }
 const guess = (s: string) => (CRYPTO[s] ? "Cripto" : ISIN.test(s) ? "Fondo de inversión" : "Acción");
 
+const isIsin = (v: string) => /^[A-Z]{2}[A-Z0-9]{9}[0-9]$/.test(v.trim().toUpperCase());
+const hasLetters = (v: string) => /[a-zA-Z\u00C0-\u017F]{2,}/.test(v);
+
+function colValues(rows: string[][], c: number) { return rows.map((r) => (r[c] ?? "").trim()).filter(Boolean); }
+function share(vals: string[], f: (v: string) => boolean) { return vals.length ? vals.filter(f).length / vals.length : 0; }
+
+// Sin cabecera reconocible: se deduce el papel de cada columna mirando su contenido.
+function guessHeaderless(rows: string[][], cd: boolean): string[] | null {
+  const sample = rows.slice(0, 200);
+  const n = Math.max(...sample.map((r) => r.length));
+  const head: string[] = Array(n).fill("");
+  const numeric: number[] = [];
+  let nameC = -1, nameLen = 0, isinC = -1;
+  for (let c = 0; c < n; c++) {
+    const v = colValues(sample, c);
+    if (!v.length) continue;
+    if (share(v, isIsin) >= 0.6) { if (isinC < 0) isinC = c; continue; }
+    if (share(v, (x) => parseDate(x) !== undefined) >= 0.6) { head[c] = "fecha"; continue; }
+    if (share(v, (x) => { const k = opKind(x); return k === "buy" || k === "sell"; }) >= 0.2) { head[c] = "tipodeoperacion"; continue; }
+    if (share(v, (x) => Number.isFinite(num(x, cd)) && !hasLetters(x)) >= 0.8) { numeric.push(c); continue; }
+    if (share(v, hasLetters) >= 0.7) {
+      const len = v.reduce((a, x) => a + x.length, 0) / v.length;
+      if (len > nameLen) { nameLen = len; nameC = c; }
+    }
+  }
+  if (isinC > -1) head[isinC] = "isin";
+  if (nameC > -1) head[nameC] = "nombre";
+  if (isinC < 0 && nameC < 0) return null;
+  if (numeric.length < 2) return null;
+  head[numeric[0]] = "cantidad";
+  head[numeric[1]] = "precio";
+  return head;
+}
+
 export function parseCsv(input: string): ParseResult {
   const fail = (error: string): ParseResult => ({ positions: [], kind: "snapshot", skipped: 0, otherOps: 0, closed: 0, warnings: [], error });
   const text = input.replace(/^\uFEFF/, "");
   const rows = parseRows(text, detectDelim(text));
   if (rows.length < 2) return fail("El archivo está vacío o solo tiene una fila.");
+
+  const commaDecimal = rows.flat().some((c) => /^-?\d+,\d+\s*€?$/.test(c.trim()));
+  const warnings: string[] = [];
 
   // La cabecera no tiene por qué ser la primera fila: se busca la que más columnas conocidas tiene.
   let hi = -1, bestScore = 0;
@@ -136,11 +173,19 @@ export function parseCsv(input: string): ParseResult {
     const score = new Set(r.map(norm).filter((c) => c && KNOWN.has(c))).size;
     if (score > bestScore) { bestScore = score; hi = i; }
   });
-  if (hi < 0 || bestScore < 2) return fail(`No reconozco la cabecera del archivo. Primera fila: ${rows[0].slice(0, 10).join(" | ")}`);
-
-  const head = rows[hi].map(norm);
-  const body = rows.slice(hi + 1);
-  const shown = rows[hi].filter((h) => h.trim()).slice(0, 14).join(", ");
+  let head: string[], body: string[][], shown: string;
+  if (hi >= 0 && bestScore >= 2) {
+    head = rows[hi].map(norm);
+    body = rows.slice(hi + 1);
+    shown = rows[hi].filter((h) => h.trim()).slice(0, 14).join(", ");
+  } else {
+    const g = guessHeaderless(rows, commaDecimal);
+    if (!g) return fail(`No reconozco el formato del archivo. Primera fila: ${rows[0].slice(0, 10).join(" | ")}`);
+    head = g;
+    body = rows;
+    shown = "(sin cabecera)";
+    warnings.push("El archivo no tiene una cabecera reconocible: deduje las columnas por su contenido (primera columna numérica = cantidad, segunda = precio). Revisa que los datos salgan bien.");
+  }
   const find = (names: string[]) => { for (const n of names) { const i = head.indexOf(n); if (i > -1) return i; } return -1; };
   const eurCol = (() => {
     for (const pre of ["valor", "importe", "amount", "total"]) {
@@ -150,8 +195,29 @@ export function parseCsv(input: string): ParseResult {
     return -1;
   })();
 
+  // Si no hay columna de símbolo, se busca un ISIN en cualquier columna o, si no, se usará el nombre del activo.
+  if (find(A.ticker) < 0 && find(A.isin) < 0 && find(A.combined) < 0) {
+    const used = new Set(head.map((h, i) => (A.type.includes(h) || A.account.includes(h) || A.currency.includes(h) || A.date.includes(h) ? i : -1)).filter((i) => i > -1));
+    let isinC = -1;
+    for (let c = 0; c < head.length && isinC < 0; c++) if (!used.has(c) && share(colValues(body, c), isIsin) >= 0.6) isinC = c;
+    if (isinC > -1) head[isinC] = "isin";
+    else if (find(A.name) < 0) {
+      let best = -1, bestLen = 0;
+      for (let c = 0; c < head.length; c++) {
+        if (used.has(c)) continue;
+        const v = colValues(body, c);
+        if (v.length && share(v, hasLetters) >= 0.7 && share(v, (x) => { const k = opKind(x); return k === "buy" || k === "sell"; }) < 0.2) {
+          const len = v.reduce((a, x) => a + x.length, 0) / v.length;
+          if (len > bestLen) { bestLen = len; best = c; }
+        }
+      }
+      if (best > -1) head[best] = "nombre";
+    }
+  }
   const tickerCol = find(A.ticker), isinCol = find(A.isin), combCol = find(A.combined);
-  if (tickerCol < 0 && isinCol < 0 && combCol < 0) return fail(`No encuentro la columna del símbolo o ISIN. Columnas que veo: ${shown}.`);
+  const byName = tickerCol < 0 && isinCol < 0 && combCol < 0;
+  if (byName && find(A.name) < 0) return fail(`No encuentro ninguna columna con el símbolo, el ISIN o el nombre del activo. Columnas que veo: ${shown}.`);
+  if (byName) warnings.push("El archivo no trae símbolo ni ISIN: busco cada activo por su nombre.");
   const qtyCol = find(A.qty);
   if (qtyCol < 0) return fail(`No encuentro la columna de cantidad. Columnas que veo: ${shown}.`);
   const avgCol = find(A.avg), priceCol = find(A.price), curCol = find(A.current), amtCol = find(A.amount);
@@ -167,19 +233,16 @@ export function parseCsv(input: string): ParseResult {
   const opCol = typeCols.filter((c) => opShare(c) >= 0.2).sort((a, b) => opShare(b) - opShare(a))[0] ?? -1;
   const typeCol = typeCols.find((c) => c !== opCol) ?? -1;
 
-  const allCells = body.flat();
-  const commaDecimal = allCells.some((c) => /^-?\d+,\d+\s*€?$/.test(c.trim()));
   const N = (c: number, r: string[]) => (c > -1 ? num((r[c] ?? "").trim(), commaDecimal) : NaN);
   const negQty = qtyCol > -1 && body.some((r) => N(qtyCol, r) < 0);
   const kind: "snapshot" | "transactions" = opCol > -1 || (dateCol > -1 && negQty) ? "transactions" : "snapshot";
 
-  const warnings: string[] = [];
   let skipped = 0, otherOps = 0, foreign = 0, usedCurrent = 0;
   const groups = new Map<string, ImportedPosition>();
 
   for (const r of body) {
     const cell = (c: number) => (c > -1 ? (r[c] ?? "").trim() : "");
-    const symbol = cleanSymbol(cell(tickerCol) || cell(isinCol) || cell(combCol));
+    const symbol = byName ? cell(nameCol).toUpperCase().replace(/\s+/g, " ") : cleanSymbol(cell(tickerCol) || cell(isinCol) || cell(combCol));
     if (!symbol) { skipped++; continue; }
     const op = opCol > -1 ? opKind(cell(opCol)) : null;
     if (op === "other") { otherOps++; continue; }
@@ -217,7 +280,7 @@ export function parseCsv(input: string): ParseResult {
       if (!g.name || g.name === g.symbol) { if (name) { g.name = name; g.nameAuto = false; } }
       if (current !== undefined) g.current = current;
     } else {
-      groups.set(key, { symbol, name: name || symbol, nameAuto: !name, type: tp || guess(symbol), typeAuto: !tp, account, lots: [lot], current });
+      groups.set(key, { symbol, name: name || symbol, nameAuto: byName ? false : !name, type: tp || guess(symbol), typeAuto: !tp, account, lots: [lot], current, needsResolve: byName });
     }
   }
 

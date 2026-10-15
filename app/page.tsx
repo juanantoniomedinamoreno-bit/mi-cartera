@@ -27,11 +27,12 @@ const fdate = (d: string) => new Date(d).toLocaleDateString("es-ES", { day: "num
 const RANGES = [["1w", "1S"], ["1m", "1M"], ["6m", "6M"], ["ytd", "YTD"], ["1y", "1A"], ["5y", "5A"], ["max", "Máx"]];
 const GROUPS = [["asset", "Activo"], ["type", "Tipo"], ["acc", "Cartera"]];
 
-type Det = { q: string; name: string; type: string; found: boolean };
+type Det = { q: string; name: string; type: string; found: boolean; symbol?: string; exact?: boolean };
 
-async function lookup(symbols: string[]): Promise<Record<string, { name: string; type: string }>> {
+type Info = { name: string; type: string; symbol: string; exact: boolean };
+async function lookup(symbols: string[]): Promise<Record<string, Info>> {
   try {
-    const r = await fetch(`/api/lookup?symbols=${encodeURIComponent(symbols.join(","))}`);
+    const r = await fetch("/api/lookup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ symbols }) });
     return await r.json();
   } catch { return {}; }
 }
@@ -133,7 +134,7 @@ export default function Home() {
     const t = setTimeout(async () => {
       const r = await lookup([q]);
       if (cancelled) return;
-      setDet(r[q] ? { q, name: r[q].name, type: r[q].type, found: true } : { q, name: q, type: guessType(q), found: false });
+      setDet(r[q] ? { q, name: r[q].name, type: r[q].type, found: true, symbol: r[q].symbol, exact: r[q].exact } : { q, name: q, type: guessType(q), found: false });
     }, 500);
     return () => { cancelled = true; clearTimeout(t); };
   }, [symInput]);
@@ -155,20 +156,31 @@ export default function Home() {
     const res = parseCsv(text);
     if (res.error) { setImportMsg(res.error); return; }
 
+    const toResolve = res.positions.filter((p) => p.needsResolve);
+    let found: Record<string, Info> = {};
+    if (toResolve.length) {
+      setImportMsg(`Identificando ${toResolve.length} activos por su nombre…`);
+      found = await lookup(toResolve.map((p) => p.symbol));
+    }
+    const unresolved: string[] = [];
     let accs = [...accounts];
     const target = tab !== "all" && accs.some((a) => a.id === tab) ? tab : accs[0]?.id ?? "main";
     const autos = new Map<string, { typeAuto: boolean; nameAuto: boolean }>();
-    const incoming: Position[] = res.positions.map((ip) => {
-      let accountId = target;
+    const mapped: Position[] = res.positions.map((ip) => {
+      let accountId = target, symbol = ip.symbol, type = ip.type;
       if (ip.account) {
         let a = accs.find((x) => x.name.toLowerCase() === ip.account!.toLowerCase());
         if (!a) { a = { id: crypto.randomUUID(), name: ip.account }; accs = [...accs, a]; }
         accountId = a.id;
       }
-      if (ip.typeAuto || ip.nameAuto) autos.set(ip.symbol, { typeAuto: ip.typeAuto, nameAuto: ip.nameAuto });
+      if (ip.needsResolve) {
+        const r = found[ip.symbol];
+        if (r) { symbol = r.symbol; if (ip.typeAuto) type = r.type; } else unresolved.push(ip.name);
+      } else if (ip.typeAuto || ip.nameAuto) autos.set(symbol, { typeAuto: ip.typeAuto, nameAuto: ip.nameAuto });
       const { qty, avg } = replay(ip.lots);
-      return { id: crypto.randomUUID(), accountId, symbol: ip.symbol, name: ip.name, type: ip.type, qty, avg, price: ip.current ?? avg, lots: ip.lots };
+      return { id: crypto.randomUUID(), accountId, symbol, name: ip.name, type, qty, avg, price: ip.current ?? avg, lots: ip.lots };
     });
+    const incoming = consolidate(mapped);
     const m = mergeImport(positions, incoming, res.kind);
     setAccounts(accs);
     setPositions(m.positions);
@@ -181,6 +193,7 @@ export default function Home() {
     if (m.dup) parts.push(`${m.dup} operaciones repetidas ignoradas`);
     if (res.otherOps) parts.push(`${res.otherOps} filas que no son compras ni ventas ignoradas`);
     if (res.skipped) parts.push(`${res.skipped} filas incompletas ignoradas`);
+    if (unresolved.length) parts.push(`no pude identificar: ${unresolved.slice(0, 5).join(", ")}${unresolved.length > 5 ? "…" : ""} (revisa el nombre o usa el ISIN)`);
     setImportMsg(parts.join(" · ") + "." + (res.warnings.length ? " " + res.warnings.join(" ") : ""));
 
     if (autos.size) {
@@ -316,12 +329,13 @@ export default function Home() {
     let info = det && det.q === symbol ? det : null;
     if (!info) {
       const r = await lookup([symbol]);
-      info = r[symbol] ? { q: symbol, name: r[symbol].name, type: r[symbol].type, found: true } : { q: symbol, name: symbol, type: guessType(symbol), found: false };
+      info = r[symbol] ? { q: symbol, name: r[symbol].name, type: r[symbol].type, found: true, symbol: r[symbol].symbol, exact: r[symbol].exact } : { q: symbol, name: symbol, type: guessType(symbol), found: false };
     }
     const type = info.found ? info.type : manualType || info.type;
+    const finalSymbol = info.found && info.symbol && !info.exact && !/^[A-Z]{2}[A-Z0-9]{9}[0-9]$/.test(symbol) ? info.symbol : symbol;
     setPositions((prev) => mergeManual(prev, {
       id: crypto.randomUUID(), accountId: String(d.get("account") || accounts[0]?.id || "main"),
-      symbol, name: info.name, type, qty, avg, price: avg,
+      symbol: finalSymbol, name: info.name, type, qty, avg, price: avg,
       buyDate: String(d.get("date") || "") || undefined,
     }));
     form.reset();
@@ -509,11 +523,11 @@ export default function Home() {
           <h2 style={{ margin: 0 }}>Añadir posición</h2>
           <label>Cartera<select name="account" key={activeTab} defaultValue={activeTab === "all" ? accounts[0]?.id : activeTab}>{accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}</select></label>
           <label>Símbolo o ISIN
-            <input value={symInput} onChange={(e) => setSymInput(e.target.value)} required autoComplete="off" placeholder="AAPL, BTC, VWCE.DE, IE00B03HCZ61…" />
+            <input value={symInput} onChange={(e) => setSymInput(e.target.value)} required autoComplete="off" placeholder="AAPL, ISIN o el nombre (Apple, Bitcoin…)" />
           </label>
           {symInput.trim().length >= 2 && (
             <div className="det" aria-live="polite">
-              {!det || det.q !== symInput.trim().toUpperCase() ? "Buscando…" : det.found ? <>✓ <b>{det.name}</b> · {det.type}</> : (
+              {!det || det.q !== symInput.trim().toUpperCase() ? "Buscando…" : det.found ? <>✓ <b>{det.name}</b>{det.symbol && !det.exact && !/^[A-Z]{2}[A-Z0-9]{9}[0-9]$/.test(det.q) ? ` (${det.symbol})` : ""} · {det.type}</> : (
                 <>
                   No lo encuentro en el mercado. Elige el tipo:
                   <select style={{ marginTop: 8 }} value={manualType || det.type} onChange={(e) => setManualType(e.target.value)}>
