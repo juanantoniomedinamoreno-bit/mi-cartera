@@ -3,7 +3,7 @@ import { CRYPTO, ISIN } from "./market";
 
 export type ImportedPosition = {
   symbol: string; name: string; type: string; account?: string; lots: Lot[];
-  current?: number; ref?: number; typeAuto: boolean; nameAuto: boolean; needsResolve?: boolean;
+  current?: number; ref?: number; refDate?: string; typeAuto: boolean; nameAuto: boolean; needsResolve?: boolean;
 };
 export type ParseResult = {
   positions: ImportedPosition[]; kind: "snapshot" | "transactions";
@@ -281,7 +281,11 @@ export function parseCsv(input: string): ParseResult {
       const eur = N(eurCol, r);
       if (Number.isFinite(eur) && eur !== 0) price = Math.abs(eur) / Math.abs(qty);
       else {
-        price = Number.isFinite(N(priceCol, r)) ? N(priceCol, r) : Number.isFinite(N(avgCol, r)) ? N(avgCol, r) : Math.abs(N(amtCol, r)) / Math.abs(qty);
+        // El precio suele venir redondeado; el importe de la operación es exacto, así que se prefiere importe / cantidad.
+        const pr = N(priceCol, r), av = N(avgCol, r), am = N(amtCol, r);
+        const base = Number.isFinite(pr) ? pr : av;
+        const fromAmt = Math.abs(am) / Math.abs(qty);
+        price = Number.isFinite(am) && am !== 0 && (!Number.isFinite(base) || Math.abs(fromAmt / base - 1) <= 0.03) ? fromAmt : base;
         if (curCcyCol > -1 && cell(curCcyCol) && cell(curCcyCol).toUpperCase() !== "EUR") foreign++;
       }
     } else {
@@ -317,7 +321,7 @@ export function parseCsv(input: string): ParseResult {
     if (kind === "transactions") {
       let best: Lot | undefined;
       for (const l of g.lots) if (l.d && (!best || l.d > best.d!)) best = l;
-      if (best) { g.ref = best.p; if (g.current === undefined) g.current = best.p; }
+      if (best) { g.ref = best.p; g.refDate = best.d; if (g.current === undefined) g.current = best.p; }
     }
     if (replay(g.lots).qty > 1e-9) positions.push(g); else closed++;
   });

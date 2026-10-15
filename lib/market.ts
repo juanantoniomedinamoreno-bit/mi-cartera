@@ -98,8 +98,35 @@ async function searchOnce(q: string, byName: boolean, upper: string): Promise<Fo
   }
 }
 
+type Ref = { p: number; d?: string };
+type Cand = { symbol: string; name: string; type: string; score: number };
+
+async function searchCandidates(q: string): Promise<Cand[]> {
+  try {
+    const res = await fetch(
+      `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=10&newsCount=0`,
+      { headers: HEADERS, cache: "no-store" }
+    );
+    const quotes: YQuote[] = (await res.json())?.quotes ?? [];
+    const want = tokens(q);
+    return quotes
+      .filter((x) => x.symbol && x.quoteType && QUOTE_TYPES[x.quoteType])
+      .map((x) => {
+        const have = tokens(`${x.longname ?? ""} ${x.shortname ?? ""}`);
+        let score = 0;
+        want.forEach((w) => { if (have.has(w)) score++; });
+        return { symbol: x.symbol!, name: x.longname || x.shortname || q, type: QUOTE_TYPES[x.quoteType!], score };
+      })
+      .filter((c) => c.score >= 1)
+      .sort((a, b) => b.score - a.score);
+  } catch {
+    return [];
+  }
+}
+
 // Busca el activo por símbolo, ISIN o nombre y devuelve su nombre, tipo y símbolo de mercado.
-export async function lookupAsset(raw: string): Promise<Found | null> {
+// Con un precio de referencia (el de la última operación), entre varios candidatos se elige el que cuadra con ese precio.
+export async function lookupAsset(raw: string, ref?: Ref): Promise<Found | null> {
   const q = raw.trim().replace(/\s+/g, " ");
   const upper = q.toUpperCase();
   if (!q) return null;
@@ -108,13 +135,26 @@ export async function lookupAsset(raw: string): Promise<Found | null> {
   if (byCryptoName) return { name: byCryptoName[1], type: "Cripto", symbol: byCryptoName[0], exact: false };
   const byName = /\s/.test(q) || (q.length > 12 && !ISIN.test(upper));
   if (!byName) return searchOnce(q, false, upper);
+
   const words = q.replace(/[.,()]/g, " ").replace(/\s+/g, " ").trim().split(" ");
-  const noise = /^(s|sa|sl|slu|inc|corp|ltd|plc|ag|nv|se|ie|acc|dist|eur|usd|gbp|clase|class|fund|fondo|r|p|s|a|b|c|d|i)$/i;
+  const noise = /^(s|sa|sl|slu|inc|corp|ltd|plc|ag|nv|se|ie|acc|dist|eur|usd|gbp|clase|class|fund|fondo|r|p|a|b|c|d|i)$/i;
   const core = words.filter((w) => !noise.test(w) && !/^[A-Za-z]-?acc/i.test(w));
   const variants = [...new Set([words.join(" "), core.join(" "), core.slice(0, 4).join(" "), core.slice(0, 3).join(" "), core.slice(0, 2).join(" ")])].filter((v) => v.length >= 3);
+  const days = ref?.d ? Math.max(0, (Date.now() - new Date(ref.d).getTime()) / 864e5) : 365;
+  const tol = Math.min(0.08 + 0.004 * days, 0.6);
+
   for (const v of variants) {
-    const r = await searchOnce(v, true, upper);
-    if (r) return r;
+    const cands = (await searchCandidates(v)).slice(0, 8);
+    if (!cands.length) continue;
+    if (!ref) return { name: cands[0].name, type: cands[0].type, symbol: cands[0].symbol, exact: false };
+    const priced = await Promise.all(cands.map(async (c) => {
+      const qt = await yahooQuote(c.symbol);
+      if (!qt) return null;
+      const rate = await toEur(qt.currency);
+      return Number.isFinite(rate) ? { c, err: Math.abs((qt.price * rate) / ref.p - 1) } : null;
+    }));
+    const ok = priced.filter((x): x is { c: Cand; err: number } => !!x && x.err <= tol).sort((a, b) => b.c.score - a.c.score || a.err - b.err);
+    if (ok.length) return { name: ok[0].c.name, type: ok[0].c.type, symbol: ok[0].c.symbol, exact: false };
   }
   return null;
 }

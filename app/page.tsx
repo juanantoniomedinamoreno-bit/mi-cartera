@@ -30,11 +30,31 @@ const GROUPS = [["asset", "Activo"], ["type", "Tipo"], ["acc", "Cartera"]];
 type Det = { q: string; name: string; type: string; found: boolean; symbol?: string; exact?: boolean };
 
 type Info = { name: string; type: string; symbol: string; exact: boolean };
-async function lookup(symbols: string[]): Promise<Record<string, Info>> {
+async function lookup(symbols: string[], refs: Record<string, { p: number; d?: string }> = {}): Promise<Record<string, Info>> {
   try {
-    const r = await fetch("/api/lookup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ symbols }) });
+    const items = symbols.map((q) => ({ q, ref: refs[q]?.p, d: refs[q]?.d }));
+    const r = await fetch("/api/lookup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ items }) });
     return await r.json();
   } catch { return {}; }
+}
+
+// Si el precio en vivo se aleja mucho del último precio del archivo importado (más cuanto más antiguo), se asume que es otro activo.
+function sane(p: Position, price: number) {
+  if (!p.ref) return true;
+  const days = p.refDate ? Math.max(0, (Date.now() - new Date(p.refDate).getTime()) / 864e5) : 365;
+  return Math.abs(price / p.ref - 1) <= Math.min(0.08 + 0.004 * days, 0.6);
+}
+
+function PlToggle({ mode, set }: { mode: string; set: (m: string) => void }) {
+  return (
+    <div className="row" style={{ gap: 6 }}>
+      <span className="label">Rendimiento</span>
+      <div className="pills">
+        <button className={mode === "pct" ? "pill on" : "pill"} style={{ padding: "3px 10px", fontSize: 13 }} onClick={() => set("pct")}>%</button>
+        <button className={mode === "eur" ? "pill on" : "pill"} style={{ padding: "3px 10px", fontSize: 13 }} onClick={() => set("eur")}>€</button>
+      </div>
+    </div>
+  );
 }
 
 function Big({ v }: { v: number }) {
@@ -53,7 +73,7 @@ export default function Home() {
     for (const p of positions) {
       const l = liveRaw[p.symbol];
       if (!l || o[p.symbol]) continue;
-      if (p.ref && (l.price / p.ref > 2.5 || l.price / p.ref < 0.4)) continue;
+      if (!sane(p, l.price)) continue;
       o[p.symbol] = l;
     }
     return o;
@@ -72,6 +92,9 @@ export default function Home() {
   const [hoverPt, setHoverPt] = useState<Point | null>(null);
   const [groupBy, setGroupBy] = useState("asset");
   const [theme, setTheme] = useState("dark");
+  const [plMode, setPlMode] = useState("pct");
+  const [editing, setEditing] = useState<Position | null>(null);
+  const editDlg = useRef<HTMLDialogElement>(null);
   const [importMsg, setImportMsg] = useState("");
   const [symInput, setSymInput] = useState("");
   const [det, setDet] = useState<Det | null>(null);
@@ -84,6 +107,7 @@ export default function Home() {
     try { lp = fixPositions(JSON.parse(localStorage.getItem(KEY) || "[]")); } catch {}
     try { la = JSON.parse(localStorage.getItem(KEYA) || "[]"); } catch {}
     try { const t = localStorage.getItem("gq_theme"); if (t) setTheme(t); } catch {}
+    try { const m = localStorage.getItem("gq_pl"); if (m === "pct" || m === "eur") setPlMode(m); } catch {}
     setPositions(lp);
     setAccounts(ensureAccounts(la, lp));
     setLoaded(true);
@@ -113,6 +137,8 @@ export default function Home() {
       }
     });
   }, []);
+
+  useEffect(() => { try { localStorage.setItem("gq_pl", plMode); } catch {} }, [plMode]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -171,7 +197,9 @@ export default function Home() {
     let found: Record<string, Info> = {};
     if (toResolve.length) {
       setImportMsg(`Identificando ${toResolve.length} activos por su nombre…`);
-      found = await lookup(toResolve.map((p) => p.symbol));
+      const refs: Record<string, { p: number; d?: string }> = {};
+      toResolve.forEach((p) => { if (p.ref !== undefined) refs[p.symbol] = { p: p.ref, d: p.refDate }; });
+      found = await lookup(toResolve.map((p) => p.symbol), refs);
     }
     const unresolved: string[] = [];
     let accs = [...accounts];
@@ -189,7 +217,7 @@ export default function Home() {
         if (r) { symbol = r.symbol; if (ip.typeAuto) type = r.type; } else unresolved.push(ip.name);
       } else if (ip.typeAuto || ip.nameAuto) autos.set(symbol, { typeAuto: ip.typeAuto, nameAuto: ip.nameAuto });
       const { qty, avg } = replay(ip.lots);
-      return { id: crypto.randomUUID(), accountId, symbol, name: ip.name, type, qty, avg, price: ip.current ?? avg, ref: ip.ref, lots: ip.lots };
+      return { id: crypto.randomUUID(), accountId, symbol, name: ip.name, type, qty, avg, price: ip.current ?? avg, ref: ip.ref, refDate: ip.refDate, lots: ip.lots };
     });
     const incoming = consolidate(mapped);
     const m = mergeImport(positions, incoming, res.kind);
@@ -417,12 +445,15 @@ export default function Home() {
               {hoverPt ? fdate(hoverPt.d) : <>{updated && <span className="live" title="Precios en vivo" />}{tabName} · valor total{updated && ` · ${updated.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" })}`}</>}
             </div>
             <Big v={hoverPt ? hoverPt.value : totals.v} />
-            <div className={`delta ${cls(heroDelta.v)}`}>{heroDelta.v >= 0 ? "↗" : "↘"} {pct(heroDelta.p)} ({money(heroDelta.v)}) <span className="label">{heroDelta.label}</span></div>
+            <div className={`delta ${cls(heroDelta.v)}`}>{heroDelta.v >= 0 ? "↗" : "↘"} {plMode === "pct" ? <>{pct(heroDelta.p)} ({money(heroDelta.v)})</> : <>{money(heroDelta.v)} ({pct(heroDelta.p)})</>} <span className="label">{heroDelta.label}</span></div>
           </div>
+          <div style={{ display: "grid", gap: 8, justifyItems: "end" }}>
           <div className="pills">
             {RANGES.map(([k, l]) => (
               <button key={k} className={range === k ? "pill on" : "pill"} onClick={() => setRange(k)}>{l}</button>
             ))}
+          </div>
+          <PlToggle mode={plMode} set={setPlMode} />
           </div>
         </div>
 
@@ -437,8 +468,8 @@ export default function Home() {
 
         <div className="stats">
           <div><span className="label">Invertido</span><b>{money(totals.c)}</b></div>
-          <div><span className="label">Ganancia / pérdida</span><b className={cls(totals.pl)}>{money(totals.pl)}</b></div>
-          <div><span className="label">Rentabilidad</span><b className={cls(totals.plp)}>{pct(totals.plp)}</b></div>
+          <div><span className="label">Rentabilidad</span><b className={cls(totals.plp)}>{plMode === "pct" ? pct(totals.plp) : money(totals.pl)}</b></div>
+          <div><span className="label">{plMode === "pct" ? "Ganancia / pérdida" : "Rentabilidad (%)"}</span><b className={cls(totals.pl)}>{plMode === "pct" ? money(totals.pl) : pct(totals.plp)}</b></div>
         </div>
       </section>
 
@@ -471,11 +502,14 @@ export default function Home() {
         </section>
 
         <section className="card">
-          <h2>Posiciones</h2>
+          <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap", marginBottom: 10 }}>
+            <h2 style={{ margin: 0 }}>Posiciones</h2>
+            <PlToggle mode={plMode} set={setPlMode} />
+          </div>
           <div className="scroll">
             {view.length === 0 ? <p className="empty">Aún no hay posiciones en esta cartera.</p> : (
               <table>
-                <thead><tr><th>Activo</th><th>Precio</th><th>Cantidad</th><th>Valor</th><th>P/L</th><th /></tr></thead>
+                <thead><tr><th>Activo</th><th>Precio</th><th>Cantidad</th><th>Valor</th><th>Rendimiento</th><th /></tr></thead>
                 <tbody>
                   {view.map((p) => {
                     const lv = live[p.symbol];
@@ -501,8 +535,8 @@ export default function Home() {
                         </td>
                         <td>{p.qty}<div className="nm">p. medio {money(p.avg)}</div></td>
                         <td><b>{money(val)}</b></td>
-                        <td className={cls(g)}>{money(g)}<div><span className={`chip ${cls(g)}`}>{pct(gp)}</span></div></td>
-                        <td><button className="x" aria-label={`Eliminar ${p.symbol}`} onClick={() => setPositions((prev) => prev.filter((x) => x.id !== p.id))}>×</button></td>
+                        <td className={cls(g)}><b>{plMode === "pct" ? pct(gp) : money(g)}</b><div className="nm" style={{ color: "inherit", opacity: 0.8 }}>{plMode === "pct" ? money(g) : pct(gp)}</div></td>
+                        <td style={{ whiteSpace: "nowrap" }}><button className="x" aria-label={`Editar ${p.name}`} title="Editar símbolo o nombre" onClick={() => { setEditing(p); editDlg.current?.showModal(); }}>✎</button><button className="x" aria-label={`Eliminar ${p.symbol}`} onClick={() => setPositions((prev) => prev.filter((x) => x.id !== p.id))}>×</button></td>
                       </tr>
                     );
                   })}
@@ -528,6 +562,31 @@ export default function Home() {
           <p className="note">Es un resumen automático de tus datos, no asesoramiento financiero. La rentabilidad pasada no garantiza la futura.</p>
         </section>
       )}
+
+      <dialog ref={editDlg} onClose={() => setEditing(null)}>
+        {editing && (
+          <form key={editing.id} onSubmit={async (e) => {
+            e.preventDefault();
+            const d = new FormData(e.currentTarget);
+            const symbol = String(d.get("symbol")).trim().toUpperCase();
+            const name = String(d.get("name")).trim();
+            const target = editing;
+            if (!symbol) return;
+            const r = (await lookup([symbol]))[symbol];
+            setPositions((prev) => consolidate(prev.map((x) => (x.id === target.id ? { ...x, symbol, name: name || r?.name || x.name, type: r?.type ?? x.type } : x))));
+            editDlg.current?.close();
+          }}>
+            <h2 style={{ margin: 0 }}>Editar activo</h2>
+            <p className="note" style={{ margin: 0 }}>Si el precio en vivo no es el de este activo, escribe aquí su símbolo o su ISIN.</p>
+            <label>Símbolo o ISIN<input name="symbol" required autoComplete="off" defaultValue={/^[A-Za-z0-9.^=\-]{1,24}$/.test(editing.symbol) ? editing.symbol : ""} placeholder="AAPL, IE00B03HCZ61…" /></label>
+            <label>Nombre<input name="name" defaultValue={editing.name} /></label>
+            <div className="row" style={{ justifyContent: "flex-end", marginTop: 4 }}>
+              <button type="button" className="ghost" onClick={() => editDlg.current?.close()}>Cancelar</button>
+              <button className="btn" type="submit">Guardar</button>
+            </div>
+          </form>
+        )}
+      </dialog>
 
       <dialog ref={dlg} onClose={() => { setSymInput(""); setDet(null); setManualType(""); }}>
         <form onSubmit={onSubmit}>

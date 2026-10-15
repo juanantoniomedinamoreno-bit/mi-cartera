@@ -1,5 +1,5 @@
 export type Account = { id: string; name: string };
-export type Position = { id: string; accountId: string; symbol: string; name: string; type: string; qty: number; avg: number; price: number; buyDate?: string; lots?: Lot[]; ref?: number };
+export type Position = { id: string; accountId: string; symbol: string; name: string; type: string; qty: number; avg: number; price: number; buyDate?: string; lots?: Lot[]; ref?: number; refDate?: string };
 export type Live = Record<string, { price: number; change24h?: number }>;
 export type Hist = Record<string, { t: number[]; p: number[] }>;
 export type Point = { d: string; value: number; invested: number };
@@ -8,19 +8,25 @@ const day = (s: number) => new Date(s * 1000).toISOString().slice(0, 10);
 
 export type Lot = { d?: string; q: number; p: number };
 
-// Aplica una operación con el método de coste medio: las ventas no cambian el precio medio.
-export function applyLot(qty: number, cost: number, l: Lot) {
-  if (l.q >= 0) return { qty: qty + l.q, cost: cost + l.q * l.p };
-  if (qty <= 0) return { qty, cost };
-  const take = Math.min(-l.q, qty);
-  return { qty: qty - take, cost: cost - take * (cost / qty) };
+// Las ventas gastan primero las compras más antiguas (FIFO), como lo calcula getquin y como se declara en España.
+type Queue = { q: number; c: number }[];
+export function applyLot(queue: Queue, l: Lot) {
+  if (l.q >= 0) { queue.push({ q: l.q, c: l.q * l.p }); return; }
+  let s = -l.q;
+  while (s > 1e-12 && queue.length) {
+    const h = queue[0], take = Math.min(s, h.q);
+    h.c -= h.c * (take / h.q); h.q -= take; s -= take;
+    if (h.q <= 1e-12) queue.shift();
+  }
 }
+const sums = (queue: Queue) => queue.reduce((a, x) => ({ qty: a.qty + x.q, cost: a.cost + x.c }), { qty: 0, cost: 0 });
 const byDate = (a: Lot, b: Lot) => (a.d ?? "").localeCompare(b.d ?? "");
 export function replay(lots: Lot[]) {
-  let qty = 0, cost = 0;
-  for (const l of [...lots].sort(byDate)) ({ qty, cost } = applyLot(qty, cost, l));
-  qty = Math.round(qty * 1e8) / 1e8;
-  return { qty, avg: qty > 1e-9 ? cost / qty : 0 };
+  const queue: Queue = [];
+  for (const l of [...lots].sort(byDate)) applyLot(queue, l);
+  const { qty, cost } = sums(queue);
+  const q = Math.round(qty * 1e8) / 1e8;
+  return { qty: q, avg: q > 1e-9 ? cost / qty : 0 };
 }
 export const lotsOf = (p: Position): Lot[] => (p.lots?.length ? p.lots : [{ d: p.buyDate, q: p.qty, p: p.avg }]);
 export function withLots(p: Position, lots: Lot[]): Position {
@@ -56,13 +62,13 @@ export function mergeImport(prev: Position[], inc: Position[], kind: "snapshot" 
     const i = out.findIndex((p) => p.accountId === n.accountId && p.symbol === n.symbol);
     if (i < 0) { out.push(n); added++; continue; }
     const old = out[i];
-    if (kind === "snapshot") { out[i] = { ...withLots(old, n.lots ?? lotsOf(n)), price: n.price, ref: n.ref ?? old.ref }; updated++; continue; }
+    if (kind === "snapshot") { out[i] = { ...withLots(old, n.lots ?? lotsOf(n)), price: n.price, ref: n.ref ?? old.ref, refDate: n.refDate ?? old.refDate }; updated++; continue; }
     const have = [...lotsOf(old)], add: Lot[] = [];
     for (const l of n.lots ?? lotsOf(n)) {
       const k = have.findIndex((h) => (h.d ?? "") === (l.d ?? "") && h.q === l.q && h.p === l.p);
       if (k > -1) { have.splice(k, 1); dup++; } else add.push(l);
     }
-    if (add.length) { out[i] = { ...withLots(old, [...lotsOf(old), ...add]), ref: n.ref ?? old.ref, price: n.price ?? old.price }; updated++; }
+    if (add.length) { out[i] = { ...withLots(old, [...lotsOf(old), ...add]), ref: n.ref ?? old.ref, refDate: n.refDate ?? old.refDate, price: n.price ?? old.price }; updated++; }
   }
   const before = out.length;
   out = out.filter((p) => p.qty > 1e-9);
@@ -80,17 +86,18 @@ export function buildSeries(positions: Position[], hist: Hist) {
     h.t.forEach((t, i) => { const k = day(t); m.set(k, h.p[i]); days.add(k); });
     maps[sym] = m;
   }
-  const st = positions.map((p) => ({ sym: p.symbol, ev: [...lotsOf(p)].sort(byDate), i: 0, qty: 0, cost: 0 }));
+  const st = positions.map((p) => ({ sym: p.symbol, ev: [...lotsOf(p)].sort(byDate), i: 0, queue: [] as Queue }));
   const last: Record<string, number> = {};
   const points: Point[] = [];
   for (const d of [...days].sort()) {
     for (const sym in maps) { const v = maps[sym].get(d); if (v !== undefined) last[sym] = v; }
     let value = 0, invested = 0;
     for (const x of st) {
-      while (x.i < x.ev.length && (x.ev[x.i].d ?? "") <= d) { ({ qty: x.qty, cost: x.cost } = applyLot(x.qty, x.cost, x.ev[x.i])); x.i++; }
-      if (last[x.sym] === undefined || x.qty <= 1e-9) continue;
-      value += x.qty * last[x.sym];
-      invested += x.cost;
+      while (x.i < x.ev.length && (x.ev[x.i].d ?? "") <= d) { applyLot(x.queue, x.ev[x.i]); x.i++; }
+      const { qty, cost } = sums(x.queue);
+      if (last[x.sym] === undefined || qty <= 1e-9) continue;
+      value += qty * last[x.sym];
+      invested += cost;
     }
     if (invested > 0) points.push({ d, value, invested });
   }
